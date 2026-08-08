@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cscli"
+version = "1.1.0"
+description = "A Cobalt-Strike-style C2 framework (CLI team server + beacon) for authorized security testing"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [{name = "cscli contributors"}]
+keywords = ["c2", "cobalt-strike", "beacon", "red-team", "security-testing"]
+
+[project.urls]
+Documentation = "https://github.com/"
+
+[tool.setuptools]
+packages = ["cs", "cs.server", "cs.client", "cs.payload", "cs.cli",
+            "cs.modules", "cs.crypto"]

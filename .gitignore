@@ -1,0 +1,13 @@
+# cscli -- ignore build/test artifacts
+__pycache__/
+*.pyc
+*.spec
+dist/
+data/
+data_*/
+*.log
+/tmp/
+
+# keep the PyInstaller entrypoint (source); PyInstaller-generated scratch/spec
+build/_pyi/
+build/*.spec

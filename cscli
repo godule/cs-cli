@@ -25,11 +25,11 @@ def main():
     # Non-interactive runner subcommands may be given as `--server` / `server`,
     # `--payload` / `payload`, etc. Normalize a leading `--` so dispatch works.
     raw_argv = list(argv)
-    norm = [a[2:] if a.startswith("--") and a[2:] in
-            ("server", "payload", "list", "task", "results") else a for a in argv]
+    _CMDS = ("server", "payload", "list", "task", "results",
+             "reverse-shell", "rsh-list", "rsh-shell")
+    norm = [a[2:] if a.startswith("--") and a[2:] in _CMDS else a for a in argv]
 
-    subcommand = next((a for a in norm if a in
-                       ("server", "payload", "list", "task", "results")), None)
+    subcommand = next((a for a in norm if a in _CMDS), None)
     if subcommand is None:
         # interactive console (TeamServer default data_dir = <repo>/data)
         from cs.cli.console import Console

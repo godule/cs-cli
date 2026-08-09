@@ -21,7 +21,7 @@ if not os.path.exists(bindir):
 
 bid = hashlib.sha1(b"compiled-beacon").hexdigest()[:16]
 proc = subprocess.Popen([bindir, f"https://127.0.0.1:{PORT}",
-                         "--name", bid, "--key", KEY, "--no-verify"],
+                         "--name", bid, "--key", KEY, "--no-verify","--interval","1"],
                         stdout=open(os.path.join(DATA,"b.log"),"w"),
                         stderr=subprocess.STDOUT)
 dl = time.time() + 15
@@ -36,7 +36,7 @@ print("[+] compiled beacon session:", sid, "(", srv.store.all()[0]['hostname'], 
 
 srv.task(sid, "exec 1+1")
 srv.task(sid, "sysinfo")
-time.sleep(6)
+time.sleep(10)
 final = srv.store.get(sid)
 results = "".join(r["data"] for r in final["results"])
 print("--- results ---")

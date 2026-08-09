@@ -6,6 +6,7 @@ import threading
 
 from .store import SessionStore
 from .listener import Listener
+from .reverseshell import ReverseShellListener
 from .. import commands as cmd
 
 
@@ -18,6 +19,7 @@ class TeamServer:
         os.makedirs(data_dir, exist_ok=True)
         self.store = SessionStore(os.path.join(data_dir, "sessions.json"))
         self.listeners = {}
+        self.rsh_listeners = {}   # name -> ReverseShellListener
         self.config = {
             "beacon_interval": 5,
             "jitter": 0.2,
@@ -96,7 +98,39 @@ class TeamServer:
             for n, l in self.listeners.items():
                 out.append({"name": n, "url": l.url, "running": l.running,
                             "port": l.port, "host": l.host})
+        for n, l in self.rsh_listeners.items():
+            out.append({"name": n, "url": l.url, "running": l.running,
+                        "port": l.port, "host": l.host, "type": "reverse-shell"})
         return out
+
+    # ---------- Reverse-shell (raw TCP) listeners ----------
+    def start_reverse_shell(self, name, host, port, on_session=None):
+        """Start a raw TCP reverse-shell listener."""
+        with self.mutex:
+            if name in self.rsh_listeners:
+                return None, "reverse-shell listener already exists"
+            if any(l.port == port for l in list(self.listeners.values()) +
+                   list(self.rsh_listeners.values())):
+                return None, f"port {port} already in use"
+        try:
+            lis = ReverseShellListener(name, host, port, on_session=on_session)
+            lis.start()
+            with self.mutex:
+                self.rsh_listeners[name] = lis
+        except Exception as e:
+            return None, f"failed to start reverse-shell listener: {e}"
+        return lis, None
+
+    def stop_reverse_shell(self, name):
+        with self.mutex:
+            lis = self.rsh_listeners.pop(name, None)
+        if not lis:
+            return False, "reverse-shell listener not found"
+        try:
+            lis.stop()
+        except Exception:
+            pass
+        return True, None
 
     # ---------- Command plumbing ----------
     def beacon_interval(self):

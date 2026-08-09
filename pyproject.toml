@@ -15,6 +15,19 @@ keywords = ["c2", "cobalt-strike", "beacon", "red-team", "security-testing"]
 [project.urls]
 Documentation = "https://github.com/"
 
+[project.optional-dependencies]
+# Optional: pypykatz enables two LSASS-related features.
+#   * `cscli parse-lsass <file>`              - parse an existing .dmp
+#   * `cscli sekurlsa [--pid <pid>]`          - live-parse local LSASS
+#                                              (mimikatz sekurlsa::logonpasswords)
+#   * `beacon[sid]> sekurlsa`                 - same, on a PyInstaller-built
+#                                              beacon (rebuild with pypykatz
+#                                              installed: pip install pypykatz &&
+#                                              ./scripts/build-binary.sh)
+lsass = ["pypykatz>=0.6.1"]
+# Full extras: everything an operator red-team setup might want.
+all = ["pypykatz>=0.6.1"]
+
 [tool.setuptools]
 packages = ["cs", "cs.server", "cs.client", "cs.payload", "cs.cli",
             "cs.modules", "cs.crypto"]

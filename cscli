@@ -27,7 +27,8 @@ def main():
     raw_argv = list(argv)
     _CMDS = ("server", "payload", "list", "task", "results",
              "disconnect", "delete",
-             "reverse-shell", "rsh-list", "rsh-shell")
+             "reverse-shell", "rsh-list", "rsh-shell",
+             "parse-lsass")
     norm = [a[2:] if a.startswith("--") and a[2:] in _CMDS else a for a in argv]
 
     subcommand = next((a for a in norm if a in _CMDS), None)

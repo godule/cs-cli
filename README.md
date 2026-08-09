@@ -253,6 +253,32 @@ write_payload(f"https://h:443","beacon.py", key=KEY, no_verify=True)
 srv.task(session_id, "shell id")
 ```
 
+## Resilience & session lifecycle
+
+**Reconnect:** the beacon never gives up on a down/restarting server. If the
+listener is unreachable (including on its very first check-in), it logs
+`tick error` and retries on every callback interval until the server is back.
+Because the beacon id is stable, reconnecting to a restarted team server
+re-attaches to the same session (last_seen refreshes).
+
+**Server-ordered disconnect:** task a beacon with `disconnect`. The beacon sends
+a goodbye, calls `/disconnect` (server drops its session record) and stops.
+
+```bash
+# non-interactive
+cscli --disconnect <session_id>
+# interactive
+cscli> disconnect <session_id>
+```
+
+**Delete a session record** (remove from the store; a live session needs
+`--force` or a prior `disconnect`):
+
+```bash
+cscli --delete <session_id> [--force]        # non-interactive
+cscli> delete <session_id> [--force]         # interactive
+```
+
 ## Persistence
 
 Session, task, and result state is JSON-persisted under `data/sessions.json`
@@ -273,6 +299,7 @@ python3 test_compiled.py # PyInstaller-compiled beacon executable end-to-end
 python3 test_cli_driver.py # non-interactive CLI driver (server/payload/list/task/wait)
 python3 test_rsh.py        # raw TCP reverse shell (real bash callback) in-process
 python3 test_rsh_cli.py    # reverse shell via the non-interactive CLI driver
+python3 test_resilience.py # reconnect on outage + disconnect/delete
 ```
 
 ## Layout

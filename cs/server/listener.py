@@ -103,6 +103,8 @@ class BeaconHTTPHandler(BaseHTTPRequestHandler):
         p = parsed.path
         if p in ("/checkin", "/register"):
             self._handle_checkin(payload, srv)
+        elif p == "/disconnect":
+            self._disconnect(payload, srv)
         elif p == "/socks_open":
             self._socks_open(payload, srv)
         elif p == "/socks":
@@ -128,6 +130,18 @@ class BeaconHTTPHandler(BaseHTTPRequestHandler):
 
     def _socks_close(self, payload, srv):
         srv.relay.close(payload.get("conn_id"))
+        self._send_json({"status": "ok"})
+
+    def _disconnect(self, payload, srv):
+        """Beacon confirms a server-ordered disconnect: drop the session record."""
+        bid = payload.get("beacon_id")
+        if bid and bid in srv.store.session_store_keys():
+            srv.store.remove(bid)
+            if getattr(srv, "on_disconnect_cb", None):
+                try:
+                    srv.on_disconnect_cb(bid)
+                except Exception:
+                    pass
         self._send_json({"status": "ok"})
 
     def _socks_pending(self, srv, sid, payload):

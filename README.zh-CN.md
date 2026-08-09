@@ -246,6 +246,30 @@ write_payload(f"https://h:443","beacon.py", key=KEY, no_verify=True)
 srv.task(session_id, "shell id")
 ```
 
+## 韧性与会话生命周期
+
+**自动重连：** beacon 不会因服务器宕机/重启而放弃。只要监听器不可达（包括最
+初的首次 checkin），它会打印 `tick error` 并按回调间隔不断重试，直到服务器恢复。
+由于 beacon id 稳定，重连到已重启的 team server 时会重新挂回到同一会话（last_seen
+刷新）。
+
+**服务端主动断连：** 给 beacon 下派 `disconnect` 任务。beacon 发送 goodbye、调用
+`/disconnect`（服务端删除其会话记录）并停止轮询。
+
+```bash
+# 非交互式
+cscli --disconnect <session_id>
+# 交互式
+cscli> disconnect <session_id>
+```
+
+**删除会话记录**（从存储中移除；活跃会话需要先 `disconnect` 或 `--force`）：
+
+```bash
+cscli --delete <session_id> [--force]        # 非交互式
+cscli> delete <session_id> [--force]         # 交互式
+```
+
 ## 持久化
 
 会话、任务与结果状态以 JSON 持久化在 `data/sessions.json`（可用 `CSCLI_DATA_DIR`
@@ -265,6 +289,7 @@ python3 test_compiled.py # PyInstaller 编译二进制端到端
 python3 test_cli_driver.py # 非交互式 CLI 驱动（server/payload/list/task/wait）
 python3 test_rsh.py        # 裸 TCP 反弹 shell（真实 bash 回调）进程内
 python3 test_rsh_cli.py    # 非交互式 CLI 驱动的反弹 shell
+python3 test_resilience.py # 断线自动重连 + disconnect/delete
 ```
 
 ## 目录结构

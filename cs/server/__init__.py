@@ -163,3 +163,27 @@ class TeamServer:
         now = time.time()
         last = s.get("last_seen") or 0
         return (now - last) < max(timeout, self.beacon_interval() * 3)
+
+    # ---------- Session disconnect / removal ----------
+    def disconnect_session(self, sid):
+        """Queue a 'disconnect' task so the beacon stops and self-removes.
+        Returns (ok, message)."""
+        s = self.store.get(sid)
+        if not s:
+            return False, "session not found"
+        if not self.is_session_alive(s):
+            # dead session: just drop the record
+            self.store.remove(sid)
+            return True, "session already dead; removed record"
+        return self.task(sid, "disconnect")
+
+    def remove_session(self, sid, force=False):
+        """Delete a session record from the store. force=True removes even if
+        alive (the beacon may still be running)."""
+        s = self.store.get(sid)
+        if not s:
+            return False, "session not found"
+        if not force and self.is_session_alive(s):
+            return False, "session alive; use 'disconnect' first or --force"
+        self.store.remove(sid)
+        return True, f"removed session {sid}"

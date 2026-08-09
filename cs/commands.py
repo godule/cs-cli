@@ -36,6 +36,7 @@ COMMANDS = {
     "socks":  ("Start SOCKS5 pivot on beacon: socks <port>", True, "socks 1080"),
     "socks-stop":  ("Stop the beacon SOCKS5 pivot", False, "socks-stop"),
     "creds":  ("Enumerate OS-exposed credentials (authorized use only): creds [env|windows|linux|all]", True, "creds all"),
+    "disconnect": ("Server-ordered disconnect: beacon stops and socket closes", False, "disconnect"),
 }
 
 # On a fresh check-in, if no task queued, beacon may run nothing.

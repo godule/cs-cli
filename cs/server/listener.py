@@ -153,6 +153,9 @@ class BeaconHTTPHandler(BaseHTTPRequestHandler):
         results = payload.get("results") or []
 
         sid = srv.on_checkin(bid, meta, addr)
+        # In multi-process mode (daemon + CLI drivers), tasks may be queued to
+        # disk by other processes; reload so we pick them up for the beacon.
+        srv.store.reload()
         for r in (results or []):
             if isinstance(r, dict) and r.get("id"):
                 srv.store.add_result(sid, r.get("id"), r.get("data"))

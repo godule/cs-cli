@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""cscli launcher - entry point for the team server console."""
+"""cscli launcher - dispatch between the interactive console and the
+non-interactive (AI/script) driver.
+
+No arguments      -> interactive Console (human operator)
+With a subcommand  -> non-interactive runner, e.g.:
+    cscli --server --https --port 443 --key mypass
+    cscli --payload --url https://HOST:443 --out beacon.py --key mypass
+    cscli --list
+    cscli --task <sid> "shell id" --wait
+    cscli --results <sid>
+"""
 import sys
 import os
 
@@ -7,9 +17,30 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from cs.cli.console import Console
+from cs.cli import runner
+
+
+def main():
+    argv = sys.argv[1:]
+    # Non-interactive runner subcommands may be given as `--server` / `server`,
+    # `--payload` / `payload`, etc. Normalize a leading `--` so dispatch works.
+    raw_argv = list(argv)
+    norm = [a[2:] if a.startswith("--") and a[2:] in
+            ("server", "payload", "list", "task", "results") else a for a in argv]
+
+    subcommand = next((a for a in norm if a in
+                       ("server", "payload", "list", "task", "results")), None)
+    if subcommand is None:
+        # interactive console (TeamServer default data_dir = <repo>/data)
+        from cs.cli.console import Console
+        c = Console()
+        try:
+            c.run(None)
+        except KeyboardInterrupt:
+            print("\n[!] bye")
+        return 0
+    return runner.run(norm)
+
 
 if __name__ == "__main__":
-    data_dir = os.environ.get("CSCLI_DATA_DIR")
-    c = Console(data_dir=data_dir)
-    c.run(None)
+    sys.exit(main())

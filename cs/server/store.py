@@ -104,6 +104,7 @@ class SessionStore:
         with self.lock:
             if sid in self.sessions:
                 self.sessions[sid]["tasks"].append(task)
+        self.save()  # persist so multi-process drivers can queue tasks for the daemon
         return tid
 
     def set_task_status(self, sid, tid, status):
@@ -130,3 +131,9 @@ class SessionStore:
             if s:
                 s["results"].append({"id": tid, "data": data, "ts": time.time()})
         self.set_task_status(sid, tid, "completed")
+        self.save()  # persist so other processes (CLI driver) can observe
+
+    def reload(self):
+        """Re-read state from disk (for multi-process CLI drivers)."""
+        with self.lock:
+            self.load()

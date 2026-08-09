@@ -167,6 +167,42 @@ def main():
     passed += expect("wdigest :" in report or "wdigest:" in report,
                      "format_sekurlsa renders the 'wdigest :' block")
 
+    # ---- wdigest toggle API ----
+    # 10. Non-Windows: enable_wdigest refuses politely.
+    if os.name != "nt":
+        ok, msg = lsass.enable_wdigest()
+        passed += expect(ok is False, "enable_wdigest on non-Windows returns False")
+        passed += expect("Windows" in msg, "enable_wdigest mentions Windows")
+        ok, msg = lsass.wdigest_status()
+        passed += expect(ok is False, "wdigest_status on non-Windows returns False")
+    else:
+        # On Windows the calls may succeed (admin) or fail with access denied;
+        # either way they must return (bool, str).
+        ok, msg = lsass.wdigest_status()
+        passed += expect(isinstance(ok, bool) and isinstance(msg, str),
+                         "wdigest_status returns (bool, str) on Windows")
+        ok, msg = lsass.enable_wdigest()
+        passed += expect(isinstance(ok, bool) and isinstance(msg, str),
+                         "enable_wdigest returns (bool, str) on Windows")
+
+    # 11. sekurlsa_logonpasswords signature supports ticket export params.
+    import inspect as _inspect
+    sig = _inspect.signature(lsass.sekurlsa_logonpasswords)
+    params = set(sig.parameters.keys())
+    passed += expect("export_dir" in params,
+                     "sekurlsa_logonpasswords has export_dir param")
+    passed += expect("export_ccache" in params,
+                     "sekurlsa_logonpasswords has export_ccache param")
+
+    # 12. sekurlsa with export on non-Windows refuses politely (windows guard
+    #     fires before any pypykatz/ticket work).
+    if os.name != "nt":
+        ok, msg = lsass.sekurlsa_logonpasswords(export_dir="/tmp/tkts")
+        passed += expect(ok is False,
+                         "sekurlsa --export-dir on non-Windows returns False")
+        passed += expect("Windows" in msg,
+                         "sekurlsa --export-dir mentions Windows")
+
     print()
     print(f"[INFO] sample formatted output:\n{'-' * 60}")
     for line in report.split("\n")[:20]:

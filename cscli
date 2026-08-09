@@ -28,7 +28,8 @@ def main():
     _CMDS = ("server", "payload", "list", "task", "results",
              "disconnect", "delete",
              "reverse-shell", "rsh-list", "rsh-shell",
-             "parse-lsass")
+             "parse-lsass", "sekurlsa",
+             "wdigest-enable", "wdigest-status")
     norm = [a[2:] if a.startswith("--") and a[2:] in _CMDS else a for a in argv]
 
     subcommand = next((a for a in norm if a in _CMDS), None)

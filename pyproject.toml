@@ -7,7 +7,7 @@ name = "cscli"
 version = "1.1.0"
 description = "A Cobalt-Strike-style C2 framework (CLI team server + beacon) for authorized security testing"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.8"
 license = {file = "LICENSE"}
 authors = [{name = "cscli contributors"}]
 keywords = ["c2", "cobalt-strike", "beacon", "red-team", "security-testing"]
